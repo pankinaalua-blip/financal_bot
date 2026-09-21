@@ -294,7 +294,7 @@ async def handle_photo(message: types.Message):
 
   try:
     response = ai_client.models.generate_content(
-        model="gemini-2.0-flash",
+        model="gemini-3.6-flash",
         contents=[
             genai_types.Part.from_bytes(
                 data=image_bytes, mime_type="image/jpeg"
