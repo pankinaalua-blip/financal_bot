@@ -36,7 +36,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Каскад моделей: если первая перегружена (ошибка 503), автоматически подхватит следующая
+# Каскад моделей при перегрузках (ошибка 503)
 AI_MODELS_CASCADE = [
     "gemini-3.6-flash",
     "gemini-2.5-flash",
@@ -54,12 +54,10 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-# Временная память состояний
+# Память состояний
 pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
-
-# Запоминаем только те чеки, которые РЕАЛЬНО успешно внесены в таблицу
 saved_receipt_file_ids = set()
 
 NAV_BUTTONS = [
@@ -76,18 +74,11 @@ NAV_BUTTONS = [
 
 
 def get_or_register_employee(user: types.User) -> str:
-  """Проверяет сотрудника по базам.
-
-  Если новый — автоматически прописывает его и в 'Справочники', и в 'Выплаты
-  команде' с формулами.
-  """
   user_id_str = str(user.id).strip()
   username_str = f"@{user.username.lower().strip()}" if user.username else ""
   full_name = (user.full_name or "Новый сотрудник").strip()
-
   official_name = None
 
-  # 1. Поиск в листе 'Справочники'
   try:
     ws_ref = spreadsheet.worksheet("Справочники")
     records = ws_ref.get_all_records()
@@ -115,10 +106,9 @@ def get_or_register_employee(user: types.User) -> str:
       ])
       print(f"➕ Новый сотрудник '{official_name}' добавлен в 'Справочники'")
   except Exception as e:
-    print(f"Ошибка чтения 'Справочников': {e}")
+    print(f"Ошибка 'Справочников': {e}")
     official_name = full_name
 
-  # 2. Проверка и добавление в лист 'Выплаты команде'
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
@@ -136,13 +126,12 @@ def get_or_register_employee(user: types.User) -> str:
           f"➕ Сотрудник '{official_name}' добавлен в 'Выплаты команде' с формулами"
       )
   except Exception as e:
-    print(f"Ошибка проверки 'Выплат': {e}")
+    print(f"Ошибка листа 'Выплаты команде': {e}")
 
   return official_name
 
 
 def get_employee_requisites(employee_name: str) -> str:
-  """Считывает реквизиты из листа 'Выплаты команде' (колонка C), фильтруя формульные ошибки"""
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     rows = ws_pay.get_all_values()
@@ -165,10 +154,6 @@ def get_employee_requisites(employee_name: str) -> str:
 
 
 def save_employee_requisites(employee_name: str, requisites_text: str):
-  """Сохраняет реквизиты в лист 'Выплаты команде' (колонка C).
-
-  Экранирует символ '+', чтобы избежать ошибки #ERROR!
-  """
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
@@ -184,7 +169,6 @@ def save_employee_requisites(employee_name: str, requisites_text: str):
 
     if matched_idx:
       clean_text = requisites_text.strip()
-      # Если текст начинается с '+' или '=', добавляем апостроф для Google Таблиц
       if clean_text.startswith(("+", "=")):
         clean_text = "'" + clean_text
       ws_pay.update_cell(matched_idx, 3, clean_text)
@@ -193,7 +177,7 @@ def save_employee_requisites(employee_name: str, requisites_text: str):
     print(f"Ошибка сохранения реквизитов: {e}")
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АНТИФРОД ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -258,7 +242,6 @@ def log_expense(
 def check_for_duplicate_receipt(
     employee: str, amount: float, merchant: str
 ) -> dict | None:
-  """Проверяет последние записи на совпадение суммы, продавца и сотрудника за сегодня"""
   try:
     ws = spreadsheet.worksheet("Операции")
     rows = ws.get_all_records()
@@ -300,7 +283,6 @@ def check_for_duplicate_receipt(
 async def show_project_selection(
     target_msg, amount: float, merchant: str, data: dict, employee: str
 ):
-  """Отрисовывает выбор проектов для чека"""
   projects = get_active_projects()
   kb_buttons = [
       [InlineKeyboardButton(text=f"📌 {p}", callback_data=f"proj_{p[:25]}")]
@@ -748,7 +730,6 @@ async def cb_admin_refresh(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pay_"))
 async def cb_pay_person_preview(callback: types.CallbackQuery):
-  """Этап 1: Просмотр суммы и чистых реквизитов сотрудника перед переводом"""
   if callback.from_user.id not in ADMIN_IDS:
     await callback.answer("Нет прав доступа", show_alert=True)
     return
@@ -789,7 +770,6 @@ async def cb_pay_person_preview(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirmpay_"))
 async def cb_confirm_payment(callback: types.CallbackQuery):
-  """Этап 2: Подтверждение перевода и списание чеков в таблице"""
   if callback.from_user.id not in ADMIN_IDS:
     await callback.answer("Нет прав доступа", show_alert=True)
     return
@@ -833,7 +813,6 @@ async def cb_confirm_payment(callback: types.CallbackQuery):
 async def handle_photo(message: types.Message):
   photo = message.photo[-1]
 
-  # Запрещаем повторную отправку только если этот чек УЖЕ РЕАЛЬНО ВНЕСЕН в таблицу
   if photo.file_unique_id in saved_receipt_file_ids:
     await message.answer(
         "⚠️ <b>Этот чек уже был успешно внесен в таблицу ранее!</b> Повторная"
@@ -912,7 +891,6 @@ async def handle_photo(message: types.Message):
         "file_unique_id": photo.file_unique_id,
     }
 
-    # Проверка смыслового дубликата в Google Таблице за сегодня
     duplicate = check_for_duplicate_receipt(employee, float(amount), merchant)
     if duplicate:
       kb_dup = InlineKeyboardMarkup(
@@ -1004,7 +982,6 @@ async def process_project_choice(callback: types.CallbackQuery):
         check_type="Чек в Telegram",
     )
 
-    # Добавляем в список сохраненных ТОЛЬКО после реальной успешной записи
     if receipt.get("file_unique_id"):
       saved_receipt_file_ids.add(receipt["file_unique_id"])
 
