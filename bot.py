@@ -3,6 +3,7 @@ from datetime import datetime
 import io
 import json
 import os
+import random
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
@@ -11,12 +12,12 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+from aiohttp import web
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 from google.oauth2.service_account import Credentials
 import gspread
-from aiohttp import web
 
 # 1. Загрузка переменных окружения
 load_dotenv()
@@ -44,21 +45,93 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
+# Временное хранилище чеков и смен
 pending_receipts = {}
+active_shifts = {}
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АВТОРЕГИСТРАЦИЯ ---
+
+
+def get_or_register_employee(user: types.User) -> str:
+  """Проверяет сотрудника по базам.
+
+  Если новый — автоматически прописывает его и в 'Справочники', и в 'Выплаты
+  команде'.
+  """
+  user_id_str = str(user.id).strip()
+  username_str = f"@{user.username.lower().strip()}" if user.username else ""
+  full_name = (user.full_name or "Новый сотрудник").strip()
+
+  official_name = None
+
+  # 1. Проверяем лист "Справочники"
+  try:
+    ws_ref = spreadsheet.worksheet("Справочники")
+    records = ws_ref.get_all_records()
+
+    for r in records:
+      chat_id = str(r.get("Chat ID", "")).strip()
+      tg_nick = str(r.get("Telegram никнейм", "")).strip().lower()
+      name = str(r.get("Имя", "")).strip()
+
+      if user_id_str and chat_id == user_id_str:
+        official_name = name
+        break
+      if username_str and tg_nick == username_str:
+        official_name = name
+        break
+
+    # Если в справочниках человека нет — вносим
+    if not official_name:
+      official_name = full_name
+      ws_ref.append_row([
+          "",
+          "",
+          official_name,
+          f"@{user.username}" if user.username else "-",
+          user_id_str,
+      ])
+      print(f"➕ Новый сотрудник {official_name} внесен в Справочники")
+  except Exception as e:
+    print(f"Ошибка проверки Справочников: {e}")
+    official_name = full_name
+
+  # 2. Проверяем лист "Выплаты команде"
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    col_names = ws_pay.col_values(1)
+
+    if official_name not in col_names:
+      next_row = len(col_names) + 1
+      formula_debt = f'=SUMIFS(Операции!F:F, Операции!G:G, A{next_row}, Операции!H:H, "К возмещению")'
+      formula_paid = f'=SUMIFS(Операции!F:F, Операции!G:G, A{next_row}, Операции!H:H, "Выплачено")'
+
+      ws_pay.append_row(
+          [official_name, "Команда", "-", formula_debt, formula_paid],
+          value_input_option="USER_ENTERED",
+      )
+      print(
+          f"➕ Сотрудник {official_name} добавлен в Выплаты команде с формулами"
+      )
+  except Exception as e:
+    print(f"Ошибка проверки Выплат: {e}")
+
+  return official_name
 
 
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-  """Создает нижнее меню кнопок в зависимости от прав (админ или сотрудник)"""
+  """Создает нижнее меню кнопок"""
   keyboard = [
       [
           KeyboardButton(text="📸 Как отправить чек"),
+          KeyboardButton(text="🍔 Обеденные (2 500 ₸)"),
+      ],
+      [
+          KeyboardButton(text="⏱ Моя смена"),
           KeyboardButton(text="💰 Мои чеки"),
-      ]
+      ],
   ]
-  # Если пишет администратор — добавляем кнопку управления выплатами
   if user_id in ADMIN_IDS:
     keyboard.append([KeyboardButton(text="💼 Панель выплат (Admin)")])
 
@@ -72,15 +145,39 @@ def get_active_projects():
     active = [
         r.get("Проект")
         for r in rows
-        if str(r.get("Статус проекта")).strip().lower() == "в работе"
+        if str(r.get("Статус проекта")).strip().lower() in ["в работе", "активен"]
     ]
-    return (
-        active
-        if active
-        else ["25.09 Концерт Баста", "27.09 Свадьба Rixos", "Склад / Общее"]
-    )
+    return active if active else ["Склад / Общее"]
   except Exception:
-    return ["25.09 Концерт Баста", "27.09 Свадьба Rixos", "Склад / Общее"]
+    return ["Склад / Общее"]
+
+
+def log_expense(
+    project: str,
+    category: str,
+    amount: float,
+    user: types.User,
+    comment: str,
+    check_type: str = "Норматив (без чека)",
+):
+  """Универсальная запись любого расхода в лист 'Операции'"""
+  employee = get_or_register_employee(user)
+  ws = spreadsheet.worksheet("Операции")
+  tx_id = f"TX-{random.randint(10000, 99999)}"
+  now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+
+  ws.append_row([
+      tx_id,
+      now_str,
+      "Расход",
+      project,
+      category,
+      amount,
+      employee,
+      "К возмещению",
+      check_type,
+      comment,
+  ])
 
 
 def get_debts_summary():
@@ -88,11 +185,21 @@ def get_debts_summary():
   rows = ws.get_all_records()
   debts = {}
   for r in rows:
-    status = str(r.get("Статус выплат", "")).strip().lower()
-    who = str(r.get("Кто оплатил", "")).strip()
-    amount_raw = r.get("Сумма (₸)", 0)
+    # Поиск по ключевым словам для защиты от опечаток в заголовках
+    status = ""
+    who = ""
+    amount_raw = 0
 
-    if status == "к возмещению" and who:
+    for k, v in r.items():
+      k_lower = str(k).lower()
+      if "статус" in k_lower:
+        status = str(v).strip().lower()
+      elif "кто" in k_lower or "сотрудник" in k_lower:
+        who = str(v).strip()
+      elif "сумм" in k_lower or "₸" in k_lower:
+        amount_raw = v
+
+    if "к возмещению" in status and who:
       try:
         amount = float(str(amount_raw).replace(" ", "").replace(",", "."))
       except ValueError:
@@ -101,31 +208,50 @@ def get_debts_summary():
   return debts
 
 
-def get_user_pending_receipts(user_name: str):
-  """Ищет невозмещенные чеки конкретного сотрудника"""
+def get_user_pending_receipts(user: types.User):
+  """Ищет невозмещенные чеки сотрудника"""
+  employee_name = get_or_register_employee(user)
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
   user_items = []
   total = 0.0
 
   for r in rows:
-    who = str(r.get("Кто оплатил", "")).strip()
-    status = str(r.get("Статус выплат", "")).strip().lower()
-    if who == user_name and status == "к возмещению":
+    status = ""
+    who = ""
+    amount_raw = 0
+    proj = "-"
+    comm = "-"
+    dt = "-"
+
+    for k, v in r.items():
+      k_lower = str(k).lower()
+      if "статус" in k_lower:
+        status = str(v).strip().lower()
+      elif "кто" in k_lower or "сотрудник" in k_lower:
+        who = str(v).strip()
+      elif "сумм" in k_lower or "₸" in k_lower:
+        amount_raw = v
+      elif "проект" in k_lower:
+        proj = str(v)
+      elif "коммент" in k_lower or "описание" in k_lower:
+        comm = str(v)
+      elif "дата" in k_lower:
+        dt = str(v)
+
+    if (
+        employee_name.lower() in who.lower()
+        or who.lower() in employee_name.lower()
+    ) and "к возмещению" in status:
       try:
-        amt = float(
-            str(r.get("Сумма (₸)", 0)).replace(" ", "").replace(",", ".")
-        )
+        amt = float(str(amount_raw).replace(" ", "").replace(",", "."))
       except ValueError:
         amt = 0.0
       total += amt
-      user_items.append({
-          "project": r.get("Проект", "-"),
-          "amount": amt,
-          "comment": r.get("Комментарий", "-"),
-          "date": r.get("Дата и время", "-"),
-      })
-  return total, user_items
+      user_items.append(
+          {"project": proj, "amount": amt, "comment": comm, "date": dt}
+      )
+  return employee_name, total, user_items
 
 
 # --- ОБРАБОТЧИКИ МЕНЮ И КОМАНД ---
@@ -133,12 +259,14 @@ def get_user_pending_receipts(user_name: str):
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+  name = get_or_register_employee(message.from_user)
   kb = get_main_keyboard(message.from_user.id)
   await message.answer(
-      f"Привет, {message.from_user.first_name}! 🎛️\n\n"
+      f"Привет, {name}! 🎛️\n\n"
       "Я бот для учета расходов на площадках.\n"
-      "Просто отправь мне фото чека (питание, такси, расходники), "
-      "и я привяжу его к нужному проекту.",
+      "• Отправь фото чека для распознавания\n"
+      "• Жми «🍔 Обеденные» для суточных 2 500 ₸\n"
+      "• Или запускай «⏱ Моя смена» для автоматического учета времени.",
       reply_markup=kb,
   )
 
@@ -147,10 +275,10 @@ async def cmd_start(message: types.Message):
 async def msg_how_to(message: types.Message):
   await message.answer(
       "📷 <b>Как отправить чек:</b>\n\n"
-      "1. Нажмите на скрепку внизу и сделайте фото чека на камеру или выберите из галереи.\n"
-      "2. ИИ автоматически распознает сумму и заведение.\n"
-      "3. Выберите кнопкой проект, для которого была покупка.\n\n"
-      "Готово! Чек сразу попадет в очередь на возмещение.",
+      "1. Нажмите на скрепку и отправьте фото чека (или скрин из Kaspi / Яндекс Go).\n"
+      "2. Gemini автоматически определит сумму и статью расхода.\n"
+      "3. Выберите проект кнопкой.\n\n"
+      "Сумма сразу добавится к вашим выплатам!",
       parse_mode="HTML",
   )
 
@@ -158,20 +286,19 @@ async def msg_how_to(message: types.Message):
 @dp.message(F.text == "💰 Мои чеки")
 async def msg_my_receipts(message: types.Message):
   status_wait = await message.answer("🔍 Проверяю ваши чеки в таблице...")
-  name = message.from_user.full_name
-  total, items = get_user_pending_receipts(name)
+  name, total, items = get_user_pending_receipts(message.from_user)
 
   if not items:
     await status_wait.edit_text(
-        f"👤 <b>{name}</b>\n\nУ вас нет активных чеков, ожидающих возмещения. Все выплачено! 🎉",
+        f"👤 <b>{name}</b>\n\nУ вас нет активных чеков к возмещению. Все выплачено! 🎉",
         parse_mode="HTML",
     )
     return
 
   text = (
-      f"👤 <b>Ваши чеки к возмещению ({name})</b>\n\n"
+      f"👤 <b>Чеки к возмещению ({name})</b>\n\n"
       f"💰 <b>Общая сумма:</b> {total:,.0f} ₸\n\n"
-      "<b>Список покупок в обработке:</b>\n"
+      "<b>Список в обработке:</b>\n"
   )
   for it in items[:10]:
     text += f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
@@ -179,17 +306,181 @@ async def msg_my_receipts(message: types.Message):
   await status_wait.edit_text(text, parse_mode="HTML")
 
 
+# --- ОБЕДЕННЫЕ И ТАЙМ-ТРЕКЕР СМЕН ---
+
+
+@dp.message(F.text == "🍔 Обеденные (2 500 ₸)")
+async def cmd_quick_meal(message: types.Message):
+  projects = get_active_projects()
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=p, callback_data=f"meal_{p[:25]}"
+              )
+          ]
+          for p in projects
+      ]
+  )
+  await message.answer(
+      "🍔 <b>Обеденные (2 500 ₸)</b>\nВыберите проект, на котором работаете:",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("meal_"))
+async def cb_confirm_meal(callback: types.CallbackQuery):
+  project_short = callback.data.replace("meal_", "")
+  full_project = next(
+      (p for p in get_active_projects() if p.startswith(project_short)),
+      "Склад / Общее",
+  )
+
+  user_id = callback.from_user.id
+  if user_id in active_shifts:
+    active_shifts[user_id]["claimed_meals"] += 1
+
+  log_expense(
+      project=full_project,
+      category="Питание команды",
+      amount=2500,
+      user=callback.from_user,
+      comment="Обеденные (быстрая выплата)",
+  )
+
+  await callback.message.edit_text(
+      f"✅ <b>Обеденные 2 500 ₸ начислены!</b>\n\n"
+      f"🎯 Проект: {full_project}\n"
+      f"Сумма передана в таблицу к возмещению.",
+      parse_mode="HTML",
+  )
+
+
+@dp.message(F.text == "⏱ Моя смена")
+async def cmd_shift_menu(message: types.Message):
+  user_id = message.from_user.id
+
+  if user_id not in active_shifts:
+    projects = get_active_projects()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"🟢 Начать: {p}", callback_data=f"startshift_{p[:20]}"
+                )
+            ]
+            for p in projects
+        ]
+    )
+    await message.answer(
+        "⏱ <b>Учет смены</b>\nУ вас нет активной смены. Выберите проект для старта монтажа:",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+  else:
+    shift = active_shifts[user_id]
+    duration = datetime.now() - shift["start_time"]
+    hours = int(duration.total_seconds() // 3600)
+    minutes = int((duration.total_seconds() % 3600) // 60)
+
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🔴 Завершить смену", callback_data="end_shift"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🍔 Взять обед сейчас (2 500 ₸)",
+                    callback_data=f"meal_{shift['project'][:25]}",
+                )
+            ],
+        ]
+    )
+    await message.answer(
+        f"⏱ <b>Текущая смена в процессе</b>\n\n"
+        f"🎯 Проект: <b>{shift['project']}</b>\n"
+        f"⏳ Прошло: <b>{hours} ч. {minutes} мин.</b>\n"
+        f"🍔 Взято обеденных: {shift['claimed_meals'] * 2500} ₸\n\n"
+        "<i>Каждые 6 часов смены автоматически начисляют 2 500 ₸.</i>",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+
+
+@dp.callback_query(F.data.startswith("startshift_"))
+async def cb_start_shift(callback: types.CallbackQuery):
+  user_id = callback.from_user.id
+  proj_prefix = callback.data.replace("startshift_", "")
+  full_project = next(
+      (p for p in get_active_projects() if p.startswith(proj_prefix)),
+      "Склад / Общее",
+  )
+
+  active_shifts[user_id] = {
+      "project": full_project,
+      "start_time": datetime.now(),
+      "claimed_meals": 0,
+  }
+
+  await callback.message.edit_text(
+      f"🟢 <b>Смена начата!</b>\n\n"
+      f"🎯 Проект: <b>{full_project}</b>\n"
+      f"🕒 Время старта: {datetime.now().strftime('%H:%M')}\n\n"
+      "При завершении смены бот рассчитает отработанные часы и начислит положенные обеденные.",
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data == "end_shift")
+async def cb_end_shift(callback: types.CallbackQuery):
+  user_id = callback.from_user.id
+  if user_id not in active_shifts:
+    await callback.answer("Смена не найдена", show_alert=True)
+    return
+
+  shift = active_shifts.pop(user_id)
+  duration = datetime.now() - shift["start_time"]
+  hours = duration.total_seconds() / 3600
+
+  earned_meals_count = int(hours // 6)
+  already_claimed = shift["claimed_meals"]
+  remaining_meals = max(0, earned_meals_count - already_claimed)
+  remaining_payout = remaining_meals * 2500
+
+  if remaining_payout > 0:
+    log_expense(
+        project=shift["project"],
+        category="Питание команды",
+        amount=remaining_payout,
+        user=callback.from_user,
+        comment=f"Обеденные за смену ({int(hours)} ч, остаток)",
+    )
+
+  msg = (
+      f"🔴 <b>Смена завершена!</b>\n\n"
+      f"🎯 Проект: {shift['project']}\n"
+      f"⏱ Отработано: {int(hours)} ч. {int((duration.total_seconds() % 3600) // 60)} мин.\n"
+      f"🍔 Положено обедов: {earned_meals_count} × 2 500 ₸\n"
+  )
+  if remaining_payout > 0:
+    msg += f"💰 Начислено к выплате: <b>{remaining_payout:,.0f} ₸</b>"
+  else:
+    msg += "👌 Все обеденные были получены ранее."
+
+  await callback.message.edit_text(msg, parse_mode="HTML")
+
+
+# --- ПАНЕЛЬ ВЫПЛАТ (ADMIN) ---
+
+
 @dp.message(F.text == "💼 Панель выплат (Admin)")
 @dp.message(Command("admin"))
 async def admin_panel_handler(message: types.Message):
-  user_id = message.from_user.id
-  if user_id not in ADMIN_IDS:
-    await message.answer(
-        "⛔️ <b>Доступ ограничен</b>\n\n"
-        f"Ваш Telegram ID: <code>{user_id}</code>\n"
-        "Добавьте его в `.env` в `ADMIN_IDS`.",
-        parse_mode="HTML",
-    )
+  if message.from_user.id not in ADMIN_IDS:
+    await message.answer("⛔️ Нет прав доступа.", parse_mode="HTML")
     return
   await render_admin_menu(message)
 
@@ -240,7 +531,7 @@ async def cb_admin_refresh(callback: types.CallbackQuery):
     await callback.answer("Нет прав доступа", show_alert=True)
     return
   await render_admin_menu(callback)
-  await callback.answer("Данные обновлены")
+  await callback.answer("Обновлено")
 
 
 @dp.callback_query(F.data.startswith("pay_"))
@@ -254,21 +545,33 @@ async def cb_pay_person(callback: types.CallbackQuery):
 
   ws = spreadsheet.worksheet("Операции")
   all_values = ws.get_all_values()
+  if not all_values:
+    return
+
+  headers = [str(h).strip().lower() for h in all_values[0]]
   status_col_idx = 8
   who_col_idx = 7
 
+  for idx, h in enumerate(headers, start=1):
+    if "статус" in h:
+      status_col_idx = idx
+    elif "кто" in h or "сотрудник" in h:
+      who_col_idx = idx
+
   for row_idx, row in enumerate(all_values[1:], start=2):
-    if len(row) >= status_col_idx:
+    if len(row) >= max(status_col_idx, who_col_idx):
       who_val = row[who_col_idx - 1].strip()
       status_val = row[status_col_idx - 1].strip().lower()
 
-      if who_val == person and status_val == "к возмещению":
+      if (
+          person.lower() in who_val.lower() or who_val.lower() in person.lower()
+      ) and "к возмещению" in status_val:
         ws.update_cell(row_idx, status_col_idx, "Выплачено")
 
   await render_admin_menu(callback)
 
 
-# --- ОБРАБОТКА ЧЕКОВ (ФОТО) ---
+# --- ОБРАБОТКА ЧЕКОВ (ФОТО) ЧЕРЕЗ GEMINI ---
 
 
 @dp.message(F.photo)
@@ -281,11 +584,11 @@ async def handle_photo(message: types.Message):
   image_bytes = file_io.getvalue()
 
   prompt = """
-    Ты финансовый сканер для компании по аренде сценического оборудования.
-    Изучи фото чека и верни СТРОГО чистый JSON:
+    Ты финансовый сканер для компании по прокату сценического оборудования.
+    Изучи чек и верни СТРОГО чистый JSON:
     {
       "amount": итоговая сумма числом (например: 4500),
-      "merchant": продавец или сервис (Яндекс Go, Magnum, Додо Пицца, АЗС и т.п.),
+      "merchant": продавец (Яндекс Go, Magnum, Додо Пицца, АЗС и т.п.),
       "category": одна из категорий: "Такси / Логистика / ГСМ", "Питание команды", "Расходники (тейп, батарейки)", "Субаренда оборудования", "Прочее",
       "description": суть покупки (2-4 слова)
     }
@@ -294,7 +597,7 @@ async def handle_photo(message: types.Message):
 
   try:
     response = ai_client.models.generate_content(
-        model="gemini-3.6-flash",
+        model="gemini-2.5-flash",
         contents=[
             genai_types.Part.from_bytes(
                 data=image_bytes, mime_type="image/jpeg"
@@ -313,12 +616,15 @@ async def handle_photo(message: types.Message):
     data = json.loads(raw.strip())
     amount = data.get("amount", 0)
 
+    # Определяем официальное имя сотрудника и регистрируем при необходимости
+    employee = get_or_register_employee(message.from_user)
+
     pending_receipts[message.from_user.id] = {
         "amount": amount,
         "merchant": data.get("merchant", "Неизвестно"),
         "category": data.get("category", "Прочее"),
         "description": data.get("description", ""),
-        "user_name": message.from_user.full_name,
+        "user_name": employee,
     }
 
     projects = get_active_projects()
@@ -339,18 +645,19 @@ async def handle_photo(message: types.Message):
 
     await status_msg.edit_text(
         f"🧾 <b>Чек:</b> {amount:,.0f} ₸ ({data.get('merchant')})\n"
-        f"📂 {data.get('category')} — {data.get('description')}\n\n"
-        "👉 <b>К какому проекту привязать?</b>",
+        f"📂 {data.get('category')} — {data.get('description')}\n"
+        f"👤 Сотрудник: <b>{employee}</b>\n\n"
+        "👉 <b>К какому проекту привязать покупку?</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
         parse_mode="HTML",
     )
   except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка обработки: {e}")
+    await status_msg.edit_text(f"⚠️ Ошибка обработки чека: {e}")
 
 
 @dp.callback_query(F.data.startswith("proj_"))
 async def process_project_choice(callback: types.CallbackQuery):
-  project_name = callback.data.replace("proj_", "")
+  project_short = callback.data.replace("proj_", "")
   user_id = callback.from_user.id
   receipt = pending_receipts.get(user_id)
 
@@ -358,37 +665,37 @@ async def process_project_choice(callback: types.CallbackQuery):
     await callback.answer("Данные чека устарели.", show_alert=True)
     return
 
+  full_project = next(
+      (p for p in get_active_projects() if p.startswith(project_short)),
+      "Склад / Общее",
+  )
+
   await callback.message.edit_reply_markup(reply_markup=None)
   status_update = await callback.message.answer("⏳ Записываю в таблицу...")
 
   try:
-    ws_ops = spreadsheet.worksheet("Операции")
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    tx_id = f"TX-{int(datetime.now().timestamp()) % 100000}"
-
-    ws_ops.append_row([
-        tx_id,
-        now_str,
-        "Расход",
-        project_name,
-        receipt["category"],
-        float(receipt["amount"]),
-        receipt["user_name"],
-        "К возмещению",
-        "Чек в Telegram",
-        f"{receipt['merchant']}: {receipt['description']}",
-    ])
+    log_expense(
+        project=full_project,
+        category=receipt["category"],
+        amount=float(receipt["amount"]),
+        user=callback.from_user,
+        comment=f"{receipt['merchant']}: {receipt['description']}",
+        check_type="Чек в Telegram",
+    )
 
     del pending_receipts[user_id]
     await status_update.edit_text(
-        "✅ <b>Расход внесен!</b>\n\n"
-        f"🎯 Проект: {project_name}\n"
+        "✅ <b>Расход внесен в таблицу!</b>\n\n"
+        f"🎯 Проект: {full_project}\n"
         f"💵 Сумма: {receipt['amount']:,.0f} ₸\n"
-        f"👤 Оплатил: {receipt['user_name']}",
+        f"👤 Сотрудник: {receipt['user_name']}",
         parse_mode="HTML",
     )
   except Exception as e:
     await status_update.edit_text(f"⚠️ Ошибка записи: {e}")
+
+
+# --- ВЕБ-СЕРВЕР ДЛЯ ОБЛАКА И ТОЧКА ВХОДА ---
 
 
 async def handle_ping(request):
@@ -396,7 +703,6 @@ async def handle_ping(request):
 
 
 async def main():
-  # Запуск фонового веб-сервера для облака
   app = web.Application()
   app.router.add_get("/", handle_ping)
   runner = web.AppRunner(app)
@@ -407,10 +713,6 @@ async def main():
 
   print(f"Сервер слушает порт {port}, запускаем бота...")
   await dp.start_polling(bot)
-
-
-if __name__ == "__main__":
-  asyncio.run(main())
 
 
 if __name__ == "__main__":
