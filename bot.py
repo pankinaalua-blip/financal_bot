@@ -57,7 +57,7 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-# Состояния и временная память
+# Память состояний
 pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
@@ -1213,4 +1213,177 @@ async def handle_photo(message: types.Message):
     try:
       resp = ai_client.models.generate_content(
           model=model_name,
-          contents=
+          contents=[
+              genai_types.Part.from_bytes(
+                  data=image_bytes, mime_type="image/jpeg"
+              ),
+              prompt,
+          ],
+      )
+      if resp and resp.text:
+        response = resp
+        break
+    except Exception as e:
+      print(f"Модель {model_name} временно недоступна ({e}). Переключаюсь...")
+      await asyncio.sleep(0.5)
+      continue
+
+  if not response or not response.text:
+    await status_msg.edit_text(
+        "⚠️ Серверы ИИ сейчас временно перегружены. Пожалуйста, отправьте чек"
+        " еще раз через пару секунд."
+    )
+    return
+
+  try:
+    raw = response.text.strip()
+    if raw.startswith("```json"):
+      raw = raw[7:]
+    if raw.startswith("```"):
+      raw = raw[3:]
+    if raw.endswith("```"):
+      raw = raw[:-3]
+
+    data = json.loads(raw.strip())
+    amount = data.get("amount", 0)
+    merchant = data.get("merchant", "Неизвестно")
+
+    employee = get_or_register_employee(message.from_user)
+
+    pending_receipts[message.from_user.id] = {
+        "amount": amount,
+        "merchant": merchant,
+        "category": data.get("category", "Прочее"),
+        "description": data.get("description", ""),
+        "user_name": employee,
+        "file_unique_id": photo.file_unique_id,
+    }
+
+    duplicate = check_for_duplicate_receipt(employee, float(amount), merchant)
+    if duplicate:
+      kb_dup = InlineKeyboardMarkup(
+          inline_keyboard=[
+              [
+                  InlineKeyboardButton(
+                      text="➕ Да, это отдельный чек",
+                      callback_data="confirm_duplicate_ok",
+                  )
+              ],
+              [
+                  InlineKeyboardButton(
+                      text="❌ Отмена (это дубль)",
+                      callback_data="cancel_duplicate",
+                  )
+              ],
+          ]
+      )
+      await status_msg.edit_text(
+          "⚠️ <b>Внимание: похожий чек уже был добавлен сегодня!</b>\n\n"
+          f"🕒 Время: {duplicate['time']}\n"
+          f"🎯 Проект: {duplicate['project']}\n"
+          f"💵 Сумма: {duplicate['amount']:,.0f} ₸ ({merchant})\n\n"
+          "Это точно <b>еще одна</b> отдельная покупка?",
+          reply_markup=kb_dup,
+          parse_mode="HTML",
+      )
+      return
+
+    await show_project_selection(status_msg, amount, merchant, data, employee)
+
+  except Exception as e:
+    await status_msg.edit_text(f"⚠️ Ошибка разбора чека: {e}")
+
+
+@dp.callback_query(F.data == "confirm_duplicate_ok")
+async def cb_confirm_duplicate(callback: types.CallbackQuery):
+  user_id = callback.from_user.id
+  receipt = pending_receipts.get(user_id)
+  if not receipt:
+    await callback.answer("Данные чека устарели", show_alert=True)
+    return
+
+  await show_project_selection(
+      callback,
+      receipt["amount"],
+      receipt["merchant"],
+      receipt,
+      receipt["user_name"],
+  )
+
+
+@dp.callback_query(F.data == "cancel_duplicate")
+async def cb_cancel_duplicate(callback: types.CallbackQuery):
+  user_id = callback.from_user.id
+  if user_id in pending_receipts:
+    del pending_receipts[user_id]
+  await callback.message.edit_text(
+      "❌ <b>Загрузка отменена.</b> Дубликат не попал в таблицу.",
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("proj_"))
+async def process_project_choice(callback: types.CallbackQuery):
+  project_short = callback.data.replace("proj_", "")
+  user_id = callback.from_user.id
+  receipt = pending_receipts.get(user_id)
+
+  if not receipt:
+    await callback.answer("Данные чека устарели.", show_alert=True)
+    return
+
+  full_project = next(
+      (p for p in get_active_projects() if p.startswith(project_short)),
+      "Склад / Общее",
+  )
+
+  await callback.message.edit_reply_markup(reply_markup=None)
+  status_update = await callback.message.answer("⏳ Записываю в таблицу...")
+
+  try:
+    log_expense(
+        project=full_project,
+        category=receipt["category"],
+        amount=float(receipt["amount"]),
+        user=callback.from_user,
+        comment=f"{receipt['merchant']}: {receipt['description']}",
+        check_type="Чек в Telegram",
+    )
+
+    if receipt.get("file_unique_id"):
+      saved_receipt_file_ids.add(receipt["file_unique_id"])
+
+    del pending_receipts[user_id]
+    await status_update.edit_text(
+        "✅ <b>Расход внесен в таблицу!</b>\n\n"
+        f"🎯 Проект: {full_project}\n"
+        f"💵 Сумма: {receipt['amount']:,.0f} ₸\n"
+        f"👤 Сотрудник: {receipt['user_name']}",
+        parse_mode="HTML",
+    )
+  except Exception as e:
+    await status_update.edit_text(f"⚠️ Ошибка записи: {e}")
+
+
+# --- ВЕБ-СЕРВЕР И ТОЧКА ВХОДА ДЛЯ RENDER ---
+
+
+async def handle_ping(request):
+  return web.Response(text="Bot is active 24/7!")
+
+
+async def main():
+  app = web.Application()
+  app.router.add_get("/", handle_ping)
+  runner = web.AppRunner(app)
+  await runner.setup()
+  port = int(os.getenv("PORT", 8080))
+  site = web.TCPSite(runner, "0.0.0.0", port)
+  await site.start()
+
+  print(f"Сервер слушает порт {port}, запускаем бота...")
+  await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+  asyncio.run(main())
