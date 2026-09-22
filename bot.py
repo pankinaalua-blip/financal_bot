@@ -58,6 +58,7 @@ spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
+processed_file_ids = set()
 
 NAV_BUTTONS = [
     "📸 Как отправить чек",
@@ -181,7 +182,7 @@ def save_employee_requisites(employee_name: str, requisites_text: str):
     print(f"Ошибка сохранения реквизитов: {e}")
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АНТИФРОД ---
 
 
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
@@ -241,6 +242,85 @@ def log_expense(
       check_type,
       comment,
   ])
+
+
+def check_for_duplicate_receipt(
+    employee: str, amount: float, merchant: str
+) -> dict | None:
+  """Проверяет последние записи на совпадение суммы, продавца и сотрудника за сегодня"""
+  try:
+    ws = spreadsheet.worksheet("Операции")
+    rows = ws.get_all_records()
+    today_str = datetime.now().strftime("%d.%m.%Y")
+
+    for r in reversed(rows[-50:]):
+      dt = str(r.get("Дата и время", ""))
+      who = str(r.get("Кто оплатил", "")).strip().lower()
+      comm = str(r.get("Комментарий", "")).lower()
+
+      try:
+        amt = float(
+            str(r.get("Сумма (₸)", 0)).replace(" ", "").replace(",", ".")
+        )
+      except ValueError:
+        amt = 0.0
+
+      if (
+          today_str in dt
+          and (employee.lower() in who or who in employee.lower())
+          and abs(amt - amount) < 0.01
+      ):
+        if (
+            merchant.lower() in comm
+            or not merchant
+            or merchant == "Неизвестно"
+        ):
+          return {
+              "time": dt.split(" ")[-1] if " " in dt else dt,
+              "project": r.get("Проект", "-"),
+              "amount": amt,
+              "comment": r.get("Комментарий", "-"),
+          }
+  except Exception as e:
+    print(f"Ошибка проверки дубликатов: {e}")
+  return None
+
+
+async def show_project_selection(
+    target_msg, amount: float, merchant: str, data: dict, employee: str
+):
+  """Отрисовывает выбор проектов для чека"""
+  projects = get_active_projects()
+  kb_buttons = [
+      [InlineKeyboardButton(text=f"📌 {p}", callback_data=f"proj_{p[:25]}")]
+      for p in projects
+  ]
+  if "Склад / Общее" not in projects:
+    kb_buttons.append([
+        InlineKeyboardButton(
+            text="🏢 Склад / Общее", callback_data="proj_Склад / Общее"
+        )
+    ])
+
+  text = (
+      f"🧾 <b>Чек:</b> {amount:,.0f} ₸ ({merchant})\n"
+      f"📂 {data.get('category', 'Прочее')} — {data.get('description', '')}\n"
+      f"👤 Сотрудник: <b>{employee}</b>\n\n"
+      "👉 <b>К какому проекту привязать покупку?</b>"
+  )
+
+  if isinstance(target_msg, types.Message):
+    await target_msg.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
+        parse_mode="HTML",
+    )
+  else:
+    await target_msg.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
+        parse_mode="HTML",
+    )
 
 
 def get_debts_summary():
@@ -322,8 +402,8 @@ async def cmd_start(message: types.Message):
   extra_text = ""
   if reqs == "Реквизиты еще не указаны":
     extra_text = (
-        "\n\n💡 <b>Важно:</b> Пожалуйста, нажмите кнопку «💳 Мои реквизиты» и"
-        " укажите ваш номер Kaspi и ИИН для переводов!"
+        "\n\n💡 <b>Важно:</b> Нажмите кнопку «💳 Мои реквизиты» и укажите номер"
+        " Kaspi / ИИН для быстрых переводов!"
     )
 
   await message.answer(
@@ -331,7 +411,7 @@ async def cmd_start(message: types.Message):
       "Я бот для учета расходов на площадках.\n"
       "• Отправь фото чека для распознавания\n"
       "• Жми «🍔 Обеденные» для суточных 2 500 ₸\n"
-      "• Или запускай «⏱ Моя смена» для автоматического учета времени."
+      "• Запускай «⏱ Моя смена» для учета времени на монтаже."
       f"{extra_text}",
       reply_markup=kb,
       parse_mode="HTML",
@@ -343,7 +423,7 @@ async def msg_how_to(message: types.Message):
   await message.answer(
       "📷 <b>Как отправить чек:</b>\n\n"
       "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс Go).\n"
-      "2. Gemini автоматически определит сумму и категорию расхода.\n"
+      "2. ИИ автоматически определит сумму и категорию расхода.\n"
       "3. Выберите проект кнопкой.\n\n"
       "Сумма сразу добавится к вашим выплатам!",
       parse_mode="HTML",
@@ -411,6 +491,24 @@ async def cb_edit_requisites(callback: types.CallbackQuery):
       "Отправьте данные текстом прямо в этот чат:",
       parse_mode="HTML",
   )
+
+
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS))
+async def handle_user_text_input(message: types.Message):
+  user_id = message.from_user.id
+  if user_id in waiting_for_requisites:
+    del waiting_for_requisites[user_id]
+    employee = get_or_register_employee(message.from_user)
+    save_employee_requisites(employee, message.text.strip())
+
+    await message.answer(
+        f"✅ <b>Реквизиты сохранены!</b>\n\n"
+        f"👤 {employee}\n"
+        f"📋 <b>Ваши данные:</b>\n<code>{message.text.strip()}</code>\n\n"
+        "Теперь при выплатах администратор будет сразу видеть эти реквизиты.",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML",
+    )
 
 
 # --- ОБЕДЕННЫЕ И ТАЙМ-ТРЕКЕР СМЕН ---
@@ -639,7 +737,6 @@ async def cb_admin_refresh(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pay_"))
 async def cb_pay_person_preview(callback: types.CallbackQuery):
-  """Этап 1: Просмотр суммы и реквизитов сотрудника перед переводом"""
   if callback.from_user.id not in ADMIN_IDS:
     await callback.answer("Нет прав доступа", show_alert=True)
     return
@@ -647,7 +744,6 @@ async def cb_pay_person_preview(callback: types.CallbackQuery):
   person_prefix = callback.data.replace("pay_", "")
   debts = get_debts_summary()
 
-  # Находим полное имя человека
   full_person_name = next(
       (p for p in debts if p.startswith(person_prefix)), person_prefix
   )
@@ -681,7 +777,6 @@ async def cb_pay_person_preview(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirmpay_"))
 async def cb_confirm_payment(callback: types.CallbackQuery):
-  """Этап 2: Подтверждение перевода и списание чеков в таблице"""
   if callback.from_user.id not in ADMIN_IDS:
     await callback.answer("Нет прав доступа", show_alert=True)
     return
@@ -718,35 +813,24 @@ async def cb_confirm_payment(callback: types.CallbackQuery):
   await render_admin_menu(callback)
 
 
-# --- ПЕРЕХВАТ ВВОДА РЕКВИЗИТОВ ТЕКСТОМ ---
-
-
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS))
-async def handle_user_text_input(message: types.Message):
-  user_id = message.from_user.id
-  if user_id in waiting_for_requisites:
-    del waiting_for_requisites[user_id]
-    employee = get_or_register_employee(message.from_user)
-    save_employee_requisites(employee, message.text.strip())
-
-    await message.answer(
-        f"✅ <b>Реквизиты сохранены!</b>\n\n"
-        f"👤 {employee}\n"
-        f"📋 <b>Ваши данные:</b>\n<code>{message.text.strip()}</code>\n\n"
-        "Теперь при выплатах администратор будет сразу видеть эти реквизиты.",
-        reply_markup=get_main_keyboard(user_id),
-        parse_mode="HTML",
-    )
-
-
-# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ЧЕРЕЗ КАСКАД МОДЕЛЕЙ ИИ ---
+# --- РАСПОЗНАВАНИЕ ЧЕКОВ, КАСКАД ИИ И ЗАЩИТА ОТ ДУБЛИКАТОВ ---
 
 
 @dp.message(F.photo)
 async def handle_photo(message: types.Message):
+  photo = message.photo[-1]
+
+  # 1. Защита от моментального двойного клика по одной фотографии
+  if photo.file_unique_id in processed_file_ids:
+    await message.answer(
+        "⚠️ <b>Этот чек уже был отправлен!</b> Повторная загрузка отменена.",
+        parse_mode="HTML",
+    )
+    return
+  processed_file_ids.add(photo.file_unique_id)
+
   status_msg = await message.answer("🔍 Распознаю чек...")
 
-  photo = message.photo[-2] if len(message.photo) > 1 else message.photo[-1]
   file_io = io.BytesIO()
   await bot.download(photo, destination=file_io)
   image_bytes = file_io.getvalue()
@@ -801,39 +885,80 @@ async def handle_photo(message: types.Message):
 
     data = json.loads(raw.strip())
     amount = data.get("amount", 0)
+    merchant = data.get("merchant", "Неизвестно")
 
     employee = get_or_register_employee(message.from_user)
 
     pending_receipts[message.from_user.id] = {
         "amount": amount,
-        "merchant": data.get("merchant", "Неизвестно"),
+        "merchant": merchant,
         "category": data.get("category", "Прочее"),
         "description": data.get("description", ""),
         "user_name": employee,
     }
 
-    projects = get_active_projects()
-    kb_buttons = [
-        [InlineKeyboardButton(text=f"📌 {p}", callback_data=f"proj_{p[:25]}")]
-        for p in projects
-    ]
-    if "Склад / Общее" not in projects:
-      kb_buttons.append([
-          InlineKeyboardButton(
-              text="🏢 Склад / Общее", callback_data="proj_Склад / Общее"
-          )
-      ])
+    # 2. Проверка смыслового дубликата в Google Таблице за сегодня
+    duplicate = check_for_duplicate_receipt(employee, float(amount), merchant)
+    if duplicate:
+      kb_dup = InlineKeyboardMarkup(
+          inline_keyboard=[
+              [
+                  InlineKeyboardButton(
+                      text="➕ Да, это отдельный чек",
+                      callback_data="confirm_duplicate_ok",
+                  )
+              ],
+              [
+                  InlineKeyboardButton(
+                      text="❌ Отмена (это дубль)",
+                      callback_data="cancel_duplicate",
+                  )
+              ],
+          ]
+      )
+      await status_msg.edit_text(
+          f"⚠️ <b>Внимание: похожий чек уже был добавлен сегодня!</b>\n\n"
+          f"🕒 Время: {duplicate['time']}\n"
+          f"🎯 Проект: {duplicate['project']}\n"
+          f"💵 Сумма: {duplicate['amount']:,.0f} ₸ ({merchant})\n\n"
+          "Это точно <b>еще одна</b> отдельная покупка?",
+          reply_markup=kb_dup,
+          parse_mode="HTML",
+      )
+      return
 
-    await status_msg.edit_text(
-        f"🧾 <b>Чек:</b> {amount:,.0f} ₸ ({data.get('merchant')})\n"
-        f"📂 {data.get('category')} — {data.get('description')}\n"
-        f"👤 Сотрудник: <b>{employee}</b>\n\n"
-        "👉 <b>К какому проекту привязать покупку?</b>",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_buttons),
-        parse_mode="HTML",
-    )
+    await show_project_selection(status_msg, amount, merchant, data, employee)
+
   except Exception as e:
     await status_msg.edit_text(f"⚠️ Ошибка разбора чека: {e}")
+
+
+@dp.callback_query(F.data == "confirm_duplicate_ok")
+async def cb_confirm_duplicate(callback: types.CallbackQuery):
+  user_id = callback.from_user.id
+  receipt = pending_receipts.get(user_id)
+  if not receipt:
+    await callback.answer("Данные чека устарели", show_alert=True)
+    return
+
+  await show_project_selection(
+      callback,
+      receipt["amount"],
+      receipt["merchant"],
+      receipt,
+      receipt["user_name"],
+  )
+
+
+@dp.callback_query(F.data == "cancel_duplicate")
+async def cb_cancel_duplicate(callback: types.CallbackQuery):
+  user_id = callback.from_user.id
+  if user_id in pending_receipts:
+    del pending_receipts[user_id]
+  await callback.message.edit_text(
+      "❌ <b>Загрузка отменена.</b> Дубликат не попал в таблицу.",
+      parse_mode="HTML",
+  )
 
 
 @dp.callback_query(F.data.startswith("proj_"))
