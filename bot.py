@@ -36,7 +36,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Каскад моделей при перегрузках (ошибка 503)
+# Каскад моделей: если первая перегружена (ошибка 503), автоматически подхватит следующая
 AI_MODELS_CASCADE = [
     "gemini-3.6-flash",
     "gemini-2.5-flash",
@@ -58,7 +58,9 @@ spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
-processed_file_ids = set()
+
+# Запоминаем только те чеки, которые РЕАЛЬНО успешно внесены в таблицу
+saved_receipt_file_ids = set()
 
 NAV_BUTTONS = [
     "📸 Как отправить чек",
@@ -113,7 +115,7 @@ def get_or_register_employee(user: types.User) -> str:
       ])
       print(f"➕ Новый сотрудник '{official_name}' добавлен в 'Справочники'")
   except Exception as e:
-    print(f"Ошибка 'Справочников': {e}")
+    print(f"Ошибка чтения 'Справочников': {e}")
     official_name = full_name
 
   # 2. Проверка и добавление в лист 'Выплаты команде'
@@ -134,13 +136,13 @@ def get_or_register_employee(user: types.User) -> str:
           f"➕ Сотрудник '{official_name}' добавлен в 'Выплаты команде' с формулами"
       )
   except Exception as e:
-    print(f"Ошибка листа 'Выплаты команде': {e}")
+    print(f"Ошибка проверки 'Выплат': {e}")
 
   return official_name
 
 
 def get_employee_requisites(employee_name: str) -> str:
-  """Считывает реквизиты из листа 'Выплаты команде' (колонка C)"""
+  """Считывает реквизиты из листа 'Выплаты команде' (колонка C), фильтруя формульные ошибки"""
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     rows = ws_pay.get_all_values()
@@ -154,14 +156,19 @@ def get_employee_requisites(employee_name: str) -> str:
           and row[0].strip()
       ):
         reqs = row[2].strip()
-        return reqs if reqs and reqs != "-" else "Реквизиты еще не указаны"
+        if reqs and reqs not in ["-", "#ERROR!"]:
+          return reqs.lstrip("'")
+        return "Реквизиты еще не указаны"
   except Exception as e:
     print(f"Ошибка чтения реквизитов: {e}")
   return "Реквизиты еще не указаны"
 
 
 def save_employee_requisites(employee_name: str, requisites_text: str):
-  """Сохраняет реквизиты в лист 'Выплаты команде' (колонка C)"""
+  """Сохраняет реквизиты в лист 'Выплаты команде' (колонка C).
+
+  Экранирует символ '+', чтобы избежать ошибки #ERROR!
+  """
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
@@ -176,7 +183,11 @@ def save_employee_requisites(employee_name: str, requisites_text: str):
         break
 
     if matched_idx:
-      ws_pay.update_cell(matched_idx, 3, requisites_text)
+      clean_text = requisites_text.strip()
+      # Если текст начинается с '+' или '=', добавляем апостроф для Google Таблиц
+      if clean_text.startswith(("+", "=")):
+        clean_text = "'" + clean_text
+      ws_pay.update_cell(matched_idx, 3, clean_text)
       print(f"✅ Реквизиты для {employee_name} сохранены в строку {matched_idx}")
   except Exception as e:
     print(f"Ошибка сохранения реквизитов: {e}")
@@ -423,7 +434,7 @@ async def msg_how_to(message: types.Message):
   await message.answer(
       "📷 <b>Как отправить чек:</b>\n\n"
       "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс Go).\n"
-      "2. ИИ автоматически определит сумму и категорию расхода.\n"
+      "2. Gemini автоматически определит сумму и категорию расхода.\n"
       "3. Выберите проект кнопкой.\n\n"
       "Сумма сразу добавится к вашим выплатам!",
       parse_mode="HTML",
@@ -737,6 +748,7 @@ async def cb_admin_refresh(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pay_"))
 async def cb_pay_person_preview(callback: types.CallbackQuery):
+  """Этап 1: Просмотр суммы и чистых реквизитов сотрудника перед переводом"""
   if callback.from_user.id not in ADMIN_IDS:
     await callback.answer("Нет прав доступа", show_alert=True)
     return
@@ -777,6 +789,7 @@ async def cb_pay_person_preview(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("confirmpay_"))
 async def cb_confirm_payment(callback: types.CallbackQuery):
+  """Этап 2: Подтверждение перевода и списание чеков в таблице"""
   if callback.from_user.id not in ADMIN_IDS:
     await callback.answer("Нет прав доступа", show_alert=True)
     return
@@ -820,14 +833,14 @@ async def cb_confirm_payment(callback: types.CallbackQuery):
 async def handle_photo(message: types.Message):
   photo = message.photo[-1]
 
-  # 1. Защита от моментального двойного клика по одной фотографии
-  if photo.file_unique_id in processed_file_ids:
+  # Запрещаем повторную отправку только если этот чек УЖЕ РЕАЛЬНО ВНЕСЕН в таблицу
+  if photo.file_unique_id in saved_receipt_file_ids:
     await message.answer(
-        "⚠️ <b>Этот чек уже был отправлен!</b> Повторная загрузка отменена.",
+        "⚠️ <b>Этот чек уже был успешно внесен в таблицу ранее!</b> Повторная"
+        " запись отменена.",
         parse_mode="HTML",
     )
     return
-  processed_file_ids.add(photo.file_unique_id)
 
   status_msg = await message.answer("🔍 Распознаю чек...")
 
@@ -870,7 +883,8 @@ async def handle_photo(message: types.Message):
 
   if not response or not response.text:
     await status_msg.edit_text(
-        "⚠️ Все серверы ИИ сейчас временно перегружены. Попробуйте еще раз через 20–30 секунд."
+        "⚠️ Серверы ИИ сейчас временно перегружены. Пожалуйста, отправьте чек"
+        " еще раз через пару секунд."
     )
     return
 
@@ -895,9 +909,10 @@ async def handle_photo(message: types.Message):
         "category": data.get("category", "Прочее"),
         "description": data.get("description", ""),
         "user_name": employee,
+        "file_unique_id": photo.file_unique_id,
     }
 
-    # 2. Проверка смыслового дубликата в Google Таблице за сегодня
+    # Проверка смыслового дубликата в Google Таблице за сегодня
     duplicate = check_for_duplicate_receipt(employee, float(amount), merchant)
     if duplicate:
       kb_dup = InlineKeyboardMarkup(
@@ -917,7 +932,7 @@ async def handle_photo(message: types.Message):
           ]
       )
       await status_msg.edit_text(
-          f"⚠️ <b>Внимание: похожий чек уже был добавлен сегодня!</b>\n\n"
+          "⚠️ <b>Внимание: похожий чек уже был добавлен сегодня!</b>\n\n"
           f"🕒 Время: {duplicate['time']}\n"
           f"🎯 Проект: {duplicate['project']}\n"
           f"💵 Сумма: {duplicate['amount']:,.0f} ₸ ({merchant})\n\n"
@@ -988,6 +1003,10 @@ async def process_project_choice(callback: types.CallbackQuery):
         comment=f"{receipt['merchant']}: {receipt['description']}",
         check_type="Чек в Telegram",
     )
+
+    # Добавляем в список сохраненных ТОЛЬКО после реальной успешной записи
+    if receipt.get("file_unique_id"):
+      saved_receipt_file_ids.add(receipt["file_unique_id"])
 
     del pending_receipts[user_id]
     await status_update.edit_text(
