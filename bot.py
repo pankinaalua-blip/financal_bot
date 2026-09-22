@@ -908,7 +908,7 @@ async def render_project_card(target, data: dict):
 
 @dp.message(VoiceProjectState.waiting_for_voice, F.voice)
 async def process_voice_project(message: types.Message, state: FSMContext):
-    status_msg = await message.answer("🎧 Вслушиваюсь в голосовое сообщение...")
+    status_msg = await message.answer("🔄 Отправка запроса к API Gemini...")
 
     voice = message.voice
     file_io = io.BytesIO()
@@ -960,6 +960,8 @@ async def process_voice_project(message: types.Message, state: FSMContext):
         )
 
     response = None
+    last_error = None
+    
     for model_name in AUDIO_MODELS_CASCADE:
         try:
             resp = await asyncio.to_thread(_call_gemini_audio, model_name)
@@ -967,11 +969,16 @@ async def process_voice_project(message: types.Message, state: FSMContext):
                 response = resp
                 break
         except Exception as e:
-            logger.warning("Модель %s временно недоступна для аудио: %s", model_name, e)
+            last_error = str(e)
+            logger.warning("Модель %s вернула ошибку: %s", model_name, e)
             continue
 
     if not response or not response.text:
-        await status_msg.edit_text("⚠️ Не удалось разобрать аудио. Попробуйте наговорить еще раз четче.")
+        error_details = html.escape(last_error) if last_error else "Пустой ответ от API"
+        await status_msg.edit_text(
+            f"⚠️ Ошибка API Gemini. Детали: <code>{error_details}</code>", 
+            parse_mode="HTML"
+        )
         return
 
     try:
@@ -987,7 +994,7 @@ async def process_voice_project(message: types.Message, state: FSMContext):
         await render_project_card(status_msg, await state.get_data())
     except Exception as e:
         logger.error("Ошибка парсинга аудио JSON: %s", e)
-        await status_msg.edit_text(f"⚠️ Ошибка разбора аудио: {e}")
+        await status_msg.edit_text(f"⚠️ Ошибка разбора JSON от Gemini. Детали: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "edit_voice_fields_menu")
@@ -1094,7 +1101,7 @@ async def cb_confirm_voice_proj(callback: types.CallbackQuery, state: FSMContext
         )
     except Exception as e:
         logger.error("Ошибка сохранения проекта: %s", e)
-        await callback.message.edit_text(f"⚠️ Ошибка записи: {e}")
+        await callback.message.edit_text(f"⚠️ Ошибка записи: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 # ---------------------------------------------------------
@@ -1205,7 +1212,7 @@ async def handle_photo(message: types.Message):
         )
         return
 
-    status_msg = await message.answer("🔍 Распознаю чек...")
+    status_msg = await message.answer("🔄 Отправка запроса к API Gemini...")
 
     file_io = io.BytesIO()
     await bot.download(photo, destination=file_io)
@@ -1236,6 +1243,8 @@ async def handle_photo(message: types.Message):
         )
 
     response = None
+    last_error = None
+    
     for model_name in IMAGE_MODELS_CASCADE:
         try:
             resp = await asyncio.to_thread(_call_gemini_image, model_name)
@@ -1243,11 +1252,16 @@ async def handle_photo(message: types.Message):
                 response = resp
                 break
         except Exception as e:
-            logger.warning("Модель %s временно недоступна: %s", model_name, e)
+            last_error = str(e)
+            logger.warning("Модель %s вернула ошибку: %s", model_name, e)
             continue
 
     if not response or not response.text:
-        await status_msg.edit_text("⚠️ Серверы ИИ временно перегружены. Отправьте чек еще раз через несколько секунд.")
+        error_details = html.escape(last_error) if last_error else "Пустой ответ от API"
+        await status_msg.edit_text(
+            f"⚠️ Ошибка API Gemini. Детали: <code>{error_details}</code>", 
+            parse_mode="HTML"
+        )
         return
 
     try:
@@ -1288,7 +1302,7 @@ async def handle_photo(message: types.Message):
 
     except Exception as e:
         logger.error("Ошибка обработки чека: %s", e)
-        await status_msg.edit_text(f"⚠️ Ошибка разбора чека: {e}")
+        await status_msg.edit_text(f"⚠️ Ошибка разбора JSON. Детали: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "confirm_duplicate_ok")
@@ -1360,7 +1374,7 @@ async def process_project_choice(callback: types.CallbackQuery):
         )
     except Exception as e:
         logger.error("Ошибка сохранения расхода: %s", e)
-        await status_update.edit_text(f"⚠️ Ошибка записи: {e}")
+        await status_update.edit_text(f"⚠️ Ошибка записи в Google Таблицу: <code>{html.escape(str(e))}</code>", parse_mode="HTML")
 
 
 # ---------------------------------------------------------
