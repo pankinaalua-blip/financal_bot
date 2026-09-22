@@ -39,10 +39,8 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Каскад моделей при перегрузках (ошибка 503)
+# Сверхбыстрый каскад моделей
 AI_MODELS_CASCADE = [
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
     "gemini-2.0-flash",
     "gemini-2.0-flash-lite",
     "gemini-1.5-flash",
@@ -124,8 +122,9 @@ def get_or_register_employee(user: types.User) -> str:
 
     if official_name not in col_names:
       next_row = len(col_names) + 1
-      formula_debt = f'=SUMIFS(Операции!F:F, Операции!G:G, A{next_row}, Операции!H:H, "К возмещению")'
-      formula_paid = f'=SUMIFS(Операции!F:F, Операции!G:G, A{next_row}, Операции!H:H, "Выплачено")'
+      # Разделитель аргументов строго точка с запятой (;)
+      formula_debt = f'=SUMIFS(Операции!F:F; Операции!G:G; A{next_row}; Операции!H:H; "К возмещению")'
+      formula_paid = f'=SUMIFS(Операции!F:F; Операции!G:G; A{next_row}; Операции!H:H; "Выплачено")'
 
       ws_pay.append_row(
           [official_name, "Команда", "-", formula_debt, formula_paid],
@@ -424,7 +423,8 @@ async def cmd_start(message: types.Message):
 async def msg_how_to(message: types.Message):
   await message.answer(
       "📷 <b>Как отправить чек:</b>\n\n"
-      "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс Go).\n"
+      "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс"
+      " Go).\n"
       "2. Gemini автоматически определит сумму и категорию расхода.\n"
       "3. Выберите проект кнопкой.\n\n"
       "Сумма сразу добавится к вашим выплатам!",
@@ -439,7 +439,8 @@ async def msg_my_receipts(message: types.Message):
 
   if not items:
     await status_wait.edit_text(
-        f"👤 <b>{name}</b>\n\nУ вас нет активных чеков к возмещению. Все выплачено! 🎉",
+        f"👤 <b>{name}</b>\n\nУ вас нет активных чеков к возмещению. Все"
+        " выплачено! 🎉",
         parse_mode="HTML",
     )
     return
@@ -450,7 +451,9 @@ async def msg_my_receipts(message: types.Message):
       "<b>Список в обработке:</b>\n"
   )
   for it in items[:10]:
-    text += f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
+    text += (
+        f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
+    )
 
   await status_wait.edit_text(text, parse_mode="HTML")
 
@@ -474,7 +477,8 @@ async def cmd_my_requisites(message: types.Message):
       f"💳 <b>Реквизиты для выплат:</b>\n\n"
       f"👤 <b>Сотрудник:</b> {employee}\n"
       f"📋 <b>Данные:</b>\n<code>{reqs}</code>\n\n"
-      "<i>По этим реквизитам администратор переводит вам деньги за чеки и обеденные.</i>",
+      "<i>По этим реквизитам администратор переводит вам деньги за чеки и"
+      " обеденные.</i>",
       reply_markup=kb,
       parse_mode="HTML",
   )
@@ -489,7 +493,8 @@ async def cb_edit_requisites(callback: types.CallbackQuery):
       "📝 <b>Введите ваши реквизиты одним сообщением:</b>\n\n"
       "Укажите номер перевода Kaspi, ИИН и номер карты.\n\n"
       "Пример:\n"
-      "<code>+7 777 123 4567 (Kaspi)\nИИН: 990102350444\nКарта: 4400 4301 9876 5432</code>\n\n"
+      "<code>+7 777 123 4567 (Kaspi)\nИИН: 990102350444\nКарта: 4400 4301 9876"
+      " 5432</code>\n\n"
       "Отправьте данные текстом прямо в этот чат:",
       parse_mode="HTML",
   )
@@ -535,9 +540,9 @@ async def cb_confirm_meal(callback: types.CallbackQuery):
   )
 
   await callback.message.edit_text(
-      f"✅ <b>Обеденные 2 500 ₸ начислены!</b>\n\n"
+      "✅ <b>Обеденные 2 500 ₸ начислены!</b>\n\n"
       f"🎯 Проект: {full_project}\n"
-      f"Сумма передана в таблицу к возмещению.",
+      "Сумма передана в таблицу к возмещению.",
       parse_mode="HTML",
   )
 
@@ -559,7 +564,8 @@ async def cmd_shift_menu(message: types.Message):
         ]
     )
     await message.answer(
-        "⏱ <b>Учет смены</b>\nУ вас нет активной смены. Выберите проект для старта:",
+        "⏱ <b>Учет смены</b>\nУ вас нет активной смены. Выберите проект для"
+        " старта:",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -585,7 +591,7 @@ async def cmd_shift_menu(message: types.Message):
         ]
     )
     await message.answer(
-        f"⏱ <b>Текущая смена в процессе</b>\n\n"
+        "⏱ <b>Текущая смена в процессе</b>\n\n"
         f"🎯 Проект: <b>{shift['project']}</b>\n"
         f"⏳ Прошло: <b>{hours} ч. {minutes} мин.</b>\n"
         f"🍔 Взято обеденных: {shift['claimed_meals'] * 2500} ₸\n\n"
@@ -611,10 +617,11 @@ async def cb_start_shift(callback: types.CallbackQuery):
   }
 
   await callback.message.edit_text(
-      f"🟢 <b>Смена начата!</b>\n\n"
+      "🟢 <b>Смена начата!</b>\n\n"
       f"🎯 Проект: <b>{full_project}</b>\n"
       f"🕒 Время старта: {datetime.now().strftime('%H:%M')}\n\n"
-      "При завершении смены бот рассчитает отработанные часы и начислит обеденные.",
+      "При завершении смены бот рассчитает отработанные часы и начислит"
+      " обеденные.",
       parse_mode="HTML",
   )
 
@@ -645,9 +652,10 @@ async def cb_end_shift(callback: types.CallbackQuery):
     )
 
   msg = (
-      f"🔴 <b>Смена завершена!</b>\n\n"
+      "🔴 <b>Смена завершена!</b>\n\n"
       f"🎯 Проект: {shift['project']}\n"
-      f"⏱ Отработано: {int(hours)} ч. {int((duration.total_seconds() % 3600) // 60)} мин.\n"
+      f"⏱ Отработано: {int(hours)} ч."
+      f" {int((duration.total_seconds() % 3600) // 60)} мин.\n"
       f"🍔 Положено обедов: {earned_meals_count} × 2 500 ₸\n"
   )
   if remaining_payout > 0:
@@ -658,7 +666,7 @@ async def cb_end_shift(callback: types.CallbackQuery):
   await callback.message.edit_text(msg, parse_mode="HTML")
 
 
-# --- ПАНЕЛЬ УПРАВЛЕНИЯ (ADMIN) И ДОБАВЛЕНИЕ МЕРОПРИЯТИЙ ГОЛОСОМ ---
+# --- ПАНЕЛЬ УПРАВЛЕНИЯ (ADMIN) И ГОЛОСОВОЙ ВВОД С ДАТОЙ ---
 
 
 @dp.message(F.text == "💼 Панель выплат (Admin)")
@@ -724,23 +732,27 @@ async def cb_start_voice_project(
   await callback.message.edit_text(
       "🎙 <b>Зажмите микрофон и надиктуйте проект:</b>\n\n"
       "Назовите дату, мероприятие, локацию, сумму сметы и предоплату.\n\n"
-      "<i>Пример:\n«Концерт Баста 25 сентября, Дворец Спорта, смета полтора"
-      " миллиона, предоплата 50%»</i>\n\n"
+      "<i>Пример:\n«Концерт Баста 25 сентября, площадка Дворец Спорта, смета"
+      " полтора миллиона, предоплата 50%»</i>\n\n"
       "Жду голосовое сообщение...",
       parse_mode="HTML",
   )
 
 
 async def render_project_card(target, data: dict):
+  event_date = data.get("event_date", "-")
+  proj_name = data.get("project_name", "-")
+  location = data.get("location", "-")
   price = float(data.get("price", 0))
   prepay_pct = int(data.get("prepay_percent", 0))
   paid_preview = price * (prepay_pct / 100.0)
 
   text = (
       "📋 <b>Проверьте данные проекта:</b>\n\n"
-      f"🎯 <b>Проект:</b> {data.get('project_name', '-')}\n"
-      f"📍 <b>Локация:</b> {data.get('location', '-')}\n"
-      f"💵 <b>Смета:</b> {price:,.0f} ₸\n"
+      f"📅 <b>Дата мероприятия:</b> {event_date}\n"
+      f"🎯 <b>Название:</b> {proj_name}\n"
+      f"📍 <b>Локация / Площадка:</b> {location}\n"
+      f"💵 <b>Смета договора:</b> {price:,.0f} ₸\n"
       f"💰 <b>Предоплата:</b> {prepay_pct}% ({paid_preview:,.0f} ₸)\n\n"
       "Всё верно?"
   )
@@ -775,7 +787,7 @@ async def render_project_card(target, data: dict):
 
 @dp.message(VoiceProjectState.waiting_for_voice, F.voice)
 async def process_voice_project(message: types.Message, state: FSMContext):
-  status_msg = await message.answer("🎧 Распознаю детали проекта...")
+  status_msg = await message.answer("🎧 Распознаю проект (1–2 сек)...")
 
   voice = message.voice
   file_io = io.BytesIO()
@@ -785,14 +797,14 @@ async def process_voice_project(message: types.Message, state: FSMContext):
   prompt = """
     Ты финансовый ассистент компании по аренде сценического оборудования.
     Послушай аудиозапись администратора о новом мероприятии/проекте.
-    Извлеки данные и верни СТРОГО чистый JSON:
+    Верни JSON строго следующего формата:
     {
-      "project_name": "краткое название проекта с датой, например: 25.09 Концерт Баста",
-      "location": "площадка или локация (например: Дворец Спорта, Склад, Rixos)",
+      "event_date": "дата мероприятия в коротком формате (например: 25.09, 15.10 или 20.11)",
+      "project_name": "название события, артиста или заказчика БЕЗ даты (например: Концерт Баста, Свадьба Азамата, Форум Digital)",
+      "location": "площадка / отель / локация (например: Отель Sheraton, Дворец Спорта, Склад, Rixos)",
       "price": общая сумма договора числом (например: 1500000),
-      "prepay_percent": 0, 50 или 100 (если сказали предоплата 50% -> 50, если оплатили полностью -> 100, если не упомянули -> 0)
+      "prepay_percent": 0, 50 или 100
     }
-    Отвечай ТОЛЬКО валидным JSON без markdown.
     """
 
   response = None
@@ -806,36 +818,34 @@ async def process_voice_project(message: types.Message, state: FSMContext):
               ),
               prompt,
           ],
+          config=genai_types.GenerateContentConfig(
+              response_mime_type="application/json",
+              temperature=0.1,
+          ),
       )
       if resp and resp.text:
         response = resp
         break
     except Exception as e:
       print(f"Ошибка аудио на {model_name}: {e}")
-      await asyncio.sleep(0.5)
+      continue
 
   if not response or not response.text:
     await status_msg.edit_text(
-        "⚠️ Не удалось разобрать аудио. Попробуйте наговорить еще раз четче."
+        "⚠️ Не удалось быстро разобрать аудио. Попробуйте наговорить еще раз."
     )
     return
 
   try:
-    raw = response.text.strip()
-    if raw.startswith("```json"):
-      raw = raw[7:]
-    if raw.startswith("```"):
-      raw = raw[3:]
-    if raw.endswith("```"):
-      raw = raw[:-3]
-
-    data = json.loads(raw.strip())
-    proj_name = data.get("project_name", "Новое мероприятие")
+    data = json.loads(response.text.strip())
+    event_date = data.get("event_date", datetime.now().strftime("%d.%m"))
+    proj_name = data.get("project_name", "Мероприятие")
     location = data.get("location", "Площадка")
     price = float(data.get("price", 0))
     prepay_pct = int(data.get("prepay_percent", 0))
 
     await state.update_data(
+        event_date=event_date,
         project_name=proj_name,
         location=location,
         price=price,
@@ -854,19 +864,24 @@ async def cb_edit_fields_menu(callback: types.CallbackQuery):
       inline_keyboard=[
           [
               InlineKeyboardButton(
-                  text="🎯 Название", callback_data="field_project_name"
+                  text="📅 Дату", callback_data="field_event_date"
               ),
               InlineKeyboardButton(
-                  text="📍 Локацию", callback_data="field_location"
+                  text="🎯 Название", callback_data="field_project_name"
               ),
           ],
           [
               InlineKeyboardButton(
-                  text="💵 Смету (сумму)", callback_data="field_price"
+                  text="📍 Локацию", callback_data="field_location"
               ),
               InlineKeyboardButton(
-                  text="💰 Предоплату (%)", callback_data="field_prepay_percent"
+                  text="💵 Смету", callback_data="field_price"
               ),
+          ],
+          [
+              InlineKeyboardButton(
+                  text="💰 Предоплату (%)", callback_data="field_prepay_percent"
+              )
           ],
           [
               InlineKeyboardButton(
@@ -891,13 +906,17 @@ async def cb_select_field_to_edit(
   await state.set_state(VoiceProjectState.editing_field)
 
   prompts = {
+      "event_date": (
+          "Введите правильную <b>дату мероприятия</b> (например:"
+          " <code>25.09</code> или <code>15.10</code>):"
+      ),
       "project_name": (
-          "Введите правильное <b>название проекта с датой</b> (например:"
-          " <code>25.09 Концерт Баста</code>):"
+          "Введите правильное <b>название проекта</b> (например: <code>Концерт"
+          " Баста</code>):"
       ),
       "location": (
-          "Введите правильную <b>локацию / площадку</b> (например: <code>Дворец"
-          " Спорта</code>):"
+          "Введите правильную <b>локацию / площадку</b> (например: <code>Отель"
+          " Sheraton</code>):"
       ),
       "price": (
           "Введите правильную <b>сумму сметы числом</b> (например:"
@@ -938,7 +957,7 @@ async def process_field_edit_text(message: types.Message, state: FSMContext):
           parse_mode="HTML",
       )
       return
-  elif field in ["project_name", "location"]:
+  elif field in ["event_date", "project_name", "location"]:
     await state.update_data({field: text_val})
 
   await state.set_state(VoiceProjectState.waiting_for_voice)
@@ -970,18 +989,33 @@ async def cb_confirm_voice_proj(
     ws_proj = spreadsheet.worksheet("Проекты")
     next_row = len(ws_proj.col_values(1)) + 1
 
+    event_date = data.get("event_date", "").strip()
+    raw_name = data.get("project_name", "").strip()
+
+    # В названии проекта для кнопок монтажников оставляем дату
+    if event_date and not raw_name.startswith(event_date):
+      full_proj_name = f"{event_date} {raw_name}"
+    else:
+      full_proj_name = raw_name
+
     total_price = float(data.get("price", 0))
     prepay_pct = int(data.get("prepay_percent", 0))
     paid_amount = total_price * (prepay_pct / 100.0)
 
-    formula_expenses = f'=SUMIFS(Операции!F:F, Операции!D:D, A{next_row}, Операции!C:C, "Расход")'
-    formula_profit = f"=D{next_row}-E{next_row}"
-    formula_margin = f"=IF(D{next_row}>0, F{next_row}/D{next_row}, 0)"
+    # ВНИМАНИЕ: Формулы с точкой с запятой (;) и сдвигом на новую колонку B:
+    # E = Доход, F = Расходы, G = Прибыль, H = Маржа
+    formula_expenses = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
+    formula_profit = f"=E{next_row}-F{next_row}"
+    formula_margin = f"=IF(E{next_row}>0; G{next_row}/E{next_row}; 0)"
 
+    # Запись в 8 колонок листа "Проекты":
+    # A: Проект, B: Дата мероприятия, C: Локация / Площадка, D: Статус проекта,
+    # E: Доход, F: Расходы, G: Прибыль, H: Маржа
     ws_proj.append_row(
         [
-            data["project_name"],
-            data["location"],
+            full_proj_name,
+            event_date,
+            data.get("location", "Площадка"),
             "В работе",
             total_price,
             formula_expenses,
@@ -999,7 +1033,7 @@ async def cb_confirm_voice_proj(
           tx_id,
           now_str,
           "Доход",
-          data["project_name"],
+          full_proj_name,
           "Комплексный продакшн",
           paid_amount,
           "Клиент",
@@ -1020,11 +1054,12 @@ async def cb_confirm_voice_proj(
 
     await callback.message.edit_text(
         f"✅ <b>Мероприятие создано!</b>\n\n"
-        f"🎯 <b>{data['project_name']}</b>\n"
-        f"📍 Локация: {data['location']}\n"
+        f"🎯 <b>{full_proj_name}</b>\n"
+        f"📅 Дата: {event_date}\n"
+        f"📍 Локация: {data.get('location', 'Площадка')}\n"
         f"💵 Смета: {total_price:,.0f} ₸\n"
         f"💰 Предоплата: {paid_amount:,.0f} ₸\n\n"
-        "<i>Проект сразу стал доступен команде для выбора.</i>",
+        "<i>Проект внесен в таблицу без ошибок и доступен команде!</i>",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -1109,7 +1144,8 @@ async def cb_pay_person_preview(callback: types.CallbackQuery):
       f"📋 <b>Реквизиты для Kaspi / Банка:</b>\n"
       f"<code>{reqs}</code>\n\n"
       "<i>1. Скопируйте данные и сделайте перевод в Kaspi.\n"
-      "2. Нажмите зеленую кнопку подтверждения ниже, чтобы закрыть долг в таблице.</i>",
+      "2. Нажмите зеленую кнопку подтверждения ниже, чтобы закрыть долг в"
+      " таблице.</i>",
       reply_markup=kb,
       parse_mode="HTML",
   )
@@ -1204,11 +1240,9 @@ async def handle_photo(message: types.Message):
       "category": одна из категорий: "Такси / Логистика / ГСМ", "Питание команды", "Расходники (тейп, батарейки)", "Субаренда оборудования", "Прочее",
       "description": суть покупки (2-4 слова)
     }
-    Отвечай ТОЛЬКО валидным JSON без markdown.
     """
 
   response = None
-
   for model_name in AI_MODELS_CASCADE:
     try:
       resp = ai_client.models.generate_content(
@@ -1219,13 +1253,16 @@ async def handle_photo(message: types.Message):
               ),
               prompt,
           ],
+          config=genai_types.GenerateContentConfig(
+              response_mime_type="application/json",
+              temperature=0.1,
+          ),
       )
       if resp and resp.text:
         response = resp
         break
     except Exception as e:
-      print(f"Модель {model_name} временно недоступна ({e}). Переключаюсь...")
-      await asyncio.sleep(0.5)
+      print(f"Модель {model_name} временно недоступна ({e})...")
       continue
 
   if not response or not response.text:
@@ -1236,15 +1273,7 @@ async def handle_photo(message: types.Message):
     return
 
   try:
-    raw = response.text.strip()
-    if raw.startswith("```json"):
-      raw = raw[7:]
-    if raw.startswith("```"):
-      raw = raw[3:]
-    if raw.endswith("```"):
-      raw = raw[:-3]
-
-    data = json.loads(raw.strip())
+    data = json.loads(response.text.strip())
     amount = data.get("amount", 0)
     merchant = data.get("merchant", "Неизвестно")
 
