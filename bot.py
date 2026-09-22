@@ -5,7 +5,7 @@ import json
 import os
 import random
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -39,10 +39,17 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Сверхбыстрый каскад моделей
-AI_MODELS_CASCADE = [
+# Для чеков (стабильность без 503)
+IMAGE_MODELS_CASCADE = [
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
     "gemini-2.0-flash",
-    "gemini-2.0-flash-lite",
+]
+
+# Для голоса (максимальная точность слуха)
+AUDIO_MODELS_CASCADE = [
+    "gemini-2.0-flash",
+    "gemini-1.5-pro",  # Старшая Pro-версия слышит идеально при перегрузе 2.0
     "gemini-1.5-flash",
 ]
 
@@ -122,7 +129,6 @@ def get_or_register_employee(user: types.User) -> str:
 
     if official_name not in col_names:
       next_row = len(col_names) + 1
-      # Разделитель аргументов строго точка с запятой (;)
       formula_debt = f'=SUMIFS(Операции!F:F; Операции!G:G; A{next_row}; Операции!H:H; "К возмещению")'
       formula_paid = f'=SUMIFS(Операции!F:F; Операции!G:G; A{next_row}; Операции!H:H; "Выплачено")'
 
@@ -732,14 +738,15 @@ async def cb_start_voice_project(
   await callback.message.edit_text(
       "🎙 <b>Зажмите микрофон и надиктуйте проект:</b>\n\n"
       "Назовите дату, мероприятие, локацию, сумму сметы и предоплату.\n\n"
-      "<i>Пример:\n«Концерт Баста 25 сентября, площадка Дворец Спорта, смета"
-      " полтора миллиона, предоплата 50%»</i>\n\n"
+      "<i>Пример:\n«Свадьба Азамата 15 октября, отель Sheraton, смета полтора"
+      " миллиона, предоплата 50%»</i>\n\n"
       "Жду голосовое сообщение...",
       parse_mode="HTML",
   )
 
 
 async def render_project_card(target, data: dict):
+  transcript = data.get("transcript", "")
   event_date = data.get("event_date", "-")
   proj_name = data.get("project_name", "-")
   location = data.get("location", "-")
@@ -747,8 +754,11 @@ async def render_project_card(target, data: dict):
   prepay_pct = int(data.get("prepay_percent", 0))
   paid_preview = price * (prepay_pct / 100.0)
 
+  transcript_block = f"🗣 <i>«{transcript}»</i>\n\n" if transcript else ""
+
   text = (
       "📋 <b>Проверьте данные проекта:</b>\n\n"
+      f"{transcript_block}"
       f"📅 <b>Дата мероприятия:</b> {event_date}\n"
       f"🎯 <b>Название:</b> {proj_name}\n"
       f"📍 <b>Локация / Площадка:</b> {location}\n"
@@ -787,7 +797,7 @@ async def render_project_card(target, data: dict):
 
 @dp.message(VoiceProjectState.waiting_for_voice, F.voice)
 async def process_voice_project(message: types.Message, state: FSMContext):
-  status_msg = await message.answer("🎧 Распознаю проект (1–2 сек)...")
+  status_msg = await message.answer("🎧 Вслушиваюсь в голосовое...")
 
   voice = message.voice
   file_io = io.BytesIO()
@@ -795,20 +805,38 @@ async def process_voice_project(message: types.Message, state: FSMContext):
   audio_bytes = file_io.getvalue()
 
   prompt = """
-    Ты финансовый ассистент компании по аренде сценического оборудования.
-    Послушай аудиозапись администратора о новом мероприятии/проекте.
-    Верни JSON строго следующего формата:
+    Ты — экспертный финансовый ассистент компании по аренде сценического оборудования.
+    Внимательно прослушай голосовое сообщение администратора о новом мероприятии/проекте.
+
+    ИНСТРУКЦИИ:
+    1. Сначала сделай точную текстовую транскрипцию всего, что услышал, в поле "transcript".
+    2. Переведи словесные числа в цифры:
+       - "полтора миллиона" / "полтора ляма" -> 1500000
+       - "пятьсот тысяч" / "полмиллиона" -> 500000
+       - "два миллиона триста тысяч" -> 2300000
+       - "пятьдесят тысяч" -> 50000
+    3. Выдели дату мероприятия:
+       - "двадцать пятое сентября" -> "25.09"
+       - "пятнадцатое октября" -> "15.10"
+       - "первое ноября" -> "01.11"
+    4. Предоплата:
+       - если сказали "аванс 50%", "предоплата половина" -> 50
+       - если сказали "полная оплата", "100%", "оплатили всё" -> 100
+       - если не упомянули или сказали "без предоплаты" -> 0
+
+    Верни СТРОГО JSON следующей структуры:
     {
-      "event_date": "дата мероприятия в коротком формате (например: 25.09, 15.10 или 20.11)",
-      "project_name": "название события, артиста или заказчика БЕЗ даты (например: Концерт Баста, Свадьба Азамата, Форум Digital)",
-      "location": "площадка / отель / локация (например: Отель Sheraton, Дворец Спорта, Склад, Rixos)",
-      "price": общая сумма договора числом (например: 1500000),
+      "transcript": "дословный текст того, что надиктовал администратор",
+      "event_date": "дата в формате ДД.ММ",
+      "project_name": "название события, заказчика или артиста БЕЗ даты",
+      "location": "площадка, ресторан или локация (например: Отель Sheraton, Дворец Спорта, Rixos)",
+      "price": сумма сметы числом (например: 1500000),
       "prepay_percent": 0, 50 или 100
     }
     """
 
   response = None
-  for model_name in AI_MODELS_CASCADE:
+  for model_name in AUDIO_MODELS_CASCADE:
     try:
       resp = ai_client.models.generate_content(
           model=model_name,
@@ -827,17 +855,18 @@ async def process_voice_project(message: types.Message, state: FSMContext):
         response = resp
         break
     except Exception as e:
-      print(f"Ошибка аудио на {model_name}: {e}")
+      print(f"Модель {model_name} временно недоступна для аудио ({e})...")
       continue
 
   if not response or not response.text:
     await status_msg.edit_text(
-        "⚠️ Не удалось быстро разобрать аудио. Попробуйте наговорить еще раз."
+        "⚠️ Не удалось разобрать аудио. Попробуйте наговорить еще раз четче."
     )
     return
 
   try:
     data = json.loads(response.text.strip())
+    transcript = data.get("transcript", "")
     event_date = data.get("event_date", datetime.now().strftime("%d.%m"))
     proj_name = data.get("project_name", "Мероприятие")
     location = data.get("location", "Площадка")
@@ -845,6 +874,7 @@ async def process_voice_project(message: types.Message, state: FSMContext):
     prepay_pct = int(data.get("prepay_percent", 0))
 
     await state.update_data(
+        transcript=transcript,
         event_date=event_date,
         project_name=proj_name,
         location=location,
@@ -992,7 +1022,6 @@ async def cb_confirm_voice_proj(
     event_date = data.get("event_date", "").strip()
     raw_name = data.get("project_name", "").strip()
 
-    # В названии проекта для кнопок монтажников оставляем дату
     if event_date and not raw_name.startswith(event_date):
       full_proj_name = f"{event_date} {raw_name}"
     else:
@@ -1002,15 +1031,11 @@ async def cb_confirm_voice_proj(
     prepay_pct = int(data.get("prepay_percent", 0))
     paid_amount = total_price * (prepay_pct / 100.0)
 
-    # ВНИМАНИЕ: Формулы с точкой с запятой (;) и сдвигом на новую колонку B:
-    # E = Доход, F = Расходы, G = Прибыль, H = Маржа
+    # Формулы листа Проекты строго с точкой с запятой (;):
     formula_expenses = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
     formula_profit = f"=E{next_row}-F{next_row}"
     formula_margin = f"=IF(E{next_row}>0; G{next_row}/E{next_row}; 0)"
 
-    # Запись в 8 колонок листа "Проекты":
-    # A: Проект, B: Дата мероприятия, C: Локация / Площадка, D: Статус проекта,
-    # E: Доход, F: Расходы, G: Прибыль, H: Маржа
     ws_proj.append_row(
         [
             full_proj_name,
@@ -1059,7 +1084,7 @@ async def cb_confirm_voice_proj(
         f"📍 Локация: {data.get('location', 'Площадка')}\n"
         f"💵 Смета: {total_price:,.0f} ₸\n"
         f"💰 Предоплата: {paid_amount:,.0f} ₸\n\n"
-        "<i>Проект внесен в таблицу без ошибок и доступен команде!</i>",
+        "<i>Проект внесен в таблицу и готов к работе!</i>",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -1192,7 +1217,10 @@ async def cb_confirm_payment(callback: types.CallbackQuery):
 # --- ПЕРЕХВАТ ВВОДА РЕКВИЗИТОВ ТЕКСТОМ ---
 
 
-@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS))
+@dp.message(
+    StateFilter(None),
+    F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS),
+)
 async def handle_user_text_input(message: types.Message):
   user_id = message.from_user.id
   if user_id in waiting_for_requisites:
@@ -1210,7 +1238,7 @@ async def handle_user_text_input(message: types.Message):
     )
 
 
-# --- РАСПОЗНАВАНИЕ ЧЕКОВ, КАСКАД ИИ И ЗАЩИТА ОТ ДУБЛИКАТОВ ---
+# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ---
 
 
 @dp.message(F.photo)
@@ -1243,7 +1271,7 @@ async def handle_photo(message: types.Message):
     """
 
   response = None
-  for model_name in AI_MODELS_CASCADE:
+  for model_name in IMAGE_MODELS_CASCADE:
     try:
       resp = ai_client.models.generate_content(
           model=model_name,
