@@ -31,10 +31,19 @@ ADMIN_IDS = [
 
 SPREADSHEET_ID = "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA"
 
-# 2. Инициализация Telegram и ИИ
+# 2. Инициализация Telegram и Google AI
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_KEY)
+
+# Каскад моделей: если первая перегружена (ошибка 503), автоматически подхватит следующая
+AI_MODELS_CASCADE = [
+    "gemini-3.6-flash",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.0-flash-lite",
+    "gemini-1.5-flash",
+]
 
 # 3. Подключение к Google Таблицам
 SCOPES = [
@@ -45,19 +54,19 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-# Временное хранилище чеков и смен
+# Временная память для загрузки чеков и активных смен
 pending_receipts = {}
 active_shifts = {}
 
 
-# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И АВТОРЕГИСТРАЦИЯ ---
+# --- АВТОРЕГИСТРАЦИЯ И СИНХРОНИЗАЦИЯ СОТРУДНИКОВ ---
 
 
 def get_or_register_employee(user: types.User) -> str:
   """Проверяет сотрудника по базам.
 
   Если новый — автоматически прописывает его и в 'Справочники', и в 'Выплаты
-  команде'.
+  команде' с формулами.
   """
   user_id_str = str(user.id).strip()
   username_str = f"@{user.username.lower().strip()}" if user.username else ""
@@ -65,7 +74,7 @@ def get_or_register_employee(user: types.User) -> str:
 
   official_name = None
 
-  # 1. Проверяем лист "Справочники"
+  # 1. Поиск в листе 'Справочники'
   try:
     ws_ref = spreadsheet.worksheet("Справочники")
     records = ws_ref.get_all_records()
@@ -82,7 +91,7 @@ def get_or_register_employee(user: types.User) -> str:
         official_name = name
         break
 
-    # Если в справочниках человека нет — вносим
+    # Если в справочнике нет — вносим нового сотрудника
     if not official_name:
       official_name = full_name
       ws_ref.append_row([
@@ -92,12 +101,12 @@ def get_or_register_employee(user: types.User) -> str:
           f"@{user.username}" if user.username else "-",
           user_id_str,
       ])
-      print(f"➕ Новый сотрудник {official_name} внесен в Справочники")
+      print(f"➕ Новый сотрудник '{official_name}' добавлен в 'Справочники'")
   except Exception as e:
-    print(f"Ошибка проверки Справочников: {e}")
+    print(f"Ошибка чтения/записи 'Справочников': {e}")
     official_name = full_name
 
-  # 2. Проверяем лист "Выплаты команде"
+  # 2. Проверка и добавление в лист 'Выплаты команде'
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
@@ -112,16 +121,19 @@ def get_or_register_employee(user: types.User) -> str:
           value_input_option="USER_ENTERED",
       )
       print(
-          f"➕ Сотрудник {official_name} добавлен в Выплаты команде с формулами"
+          f"➕ Сотрудник '{official_name}' добавлен в 'Выплаты команде' с формулами"
       )
   except Exception as e:
-    print(f"Ошибка проверки Выплат: {e}")
+    print(f"Ошибка листа 'Выплаты команде': {e}")
 
   return official_name
 
 
+# --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
+
+
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-  """Создает нижнее меню кнопок"""
+  """Создает главное меню с разделением прав доступа"""
   keyboard = [
       [
           KeyboardButton(text="📸 Как отправить чек"),
@@ -139,6 +151,7 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
 
 def get_active_projects():
+  """Считывает список проектов в статусе 'В работе'"""
   try:
     ws = spreadsheet.worksheet("Проекты")
     rows = ws.get_all_records()
@@ -160,7 +173,7 @@ def log_expense(
     comment: str,
     check_type: str = "Норматив (без чека)",
 ):
-  """Универсальная запись любого расхода в лист 'Операции'"""
+  """Универсальная запись расхода в лист 'Операции'"""
   employee = get_or_register_employee(user)
   ws = spreadsheet.worksheet("Операции")
   tx_id = f"TX-{random.randint(10000, 99999)}"
@@ -181,14 +194,13 @@ def log_expense(
 
 
 def get_debts_summary():
+  """Подсчет долгов по всем сотрудникам с адаптивным поиском колонок"""
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
   debts = {}
+
   for r in rows:
-    # Поиск по ключевым словам для защиты от опечаток в заголовках
-    status = ""
-    who = ""
-    amount_raw = 0
+    status, who, amount_raw = "", "", 0
 
     for k, v in r.items():
       k_lower = str(k).lower()
@@ -209,7 +221,7 @@ def get_debts_summary():
 
 
 def get_user_pending_receipts(user: types.User):
-  """Ищет невозмещенные чеки сотрудника"""
+  """Поиск невозмещенных расходов конкретного сотрудника"""
   employee_name = get_or_register_employee(user)
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
@@ -217,12 +229,8 @@ def get_user_pending_receipts(user: types.User):
   total = 0.0
 
   for r in rows:
-    status = ""
-    who = ""
-    amount_raw = 0
-    proj = "-"
-    comm = "-"
-    dt = "-"
+    status, who, amount_raw = "", "", 0
+    proj, comm, dt = "-", "-", "-"
 
     for k, v in r.items():
       k_lower = str(k).lower()
@@ -275,8 +283,8 @@ async def cmd_start(message: types.Message):
 async def msg_how_to(message: types.Message):
   await message.answer(
       "📷 <b>Как отправить чек:</b>\n\n"
-      "1. Нажмите на скрепку и отправьте фото чека (или скрин из Kaspi / Яндекс Go).\n"
-      "2. Gemini автоматически определит сумму и статью расхода.\n"
+      "1. Нажмите на скрепку и отправьте фото чека (или скриншот из Kaspi / Яндекс Go).\n"
+      "2. ИИ автоматически определит сумму и статью расхода.\n"
       "3. Выберите проект кнопкой.\n\n"
       "Сумма сразу добавится к вашим выплатам!",
       parse_mode="HTML",
@@ -314,11 +322,7 @@ async def cmd_quick_meal(message: types.Message):
   projects = get_active_projects()
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text=p, callback_data=f"meal_{p[:25]}"
-              )
-          ]
+          [InlineKeyboardButton(text=p, callback_data=f"meal_{p[:25]}")]
           for p in projects
       ]
   )
@@ -374,7 +378,7 @@ async def cmd_shift_menu(message: types.Message):
         ]
     )
     await message.answer(
-        "⏱ <b>Учет смены</b>\nУ вас нет активной смены. Выберите проект для старта монтажа:",
+        "⏱ <b>Учет смены</b>\nУ вас нет активной смены. Выберите проект для старта:",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -404,7 +408,7 @@ async def cmd_shift_menu(message: types.Message):
         f"🎯 Проект: <b>{shift['project']}</b>\n"
         f"⏳ Прошло: <b>{hours} ч. {minutes} мин.</b>\n"
         f"🍔 Взято обеденных: {shift['claimed_meals'] * 2500} ₸\n\n"
-        "<i>Каждые 6 часов смены автоматически начисляют 2 500 ₸.</i>",
+        "<i>Каждые полные 6 часов смены начисляют 2 500 ₸.</i>",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -429,7 +433,7 @@ async def cb_start_shift(callback: types.CallbackQuery):
       f"🟢 <b>Смена начата!</b>\n\n"
       f"🎯 Проект: <b>{full_project}</b>\n"
       f"🕒 Время старта: {datetime.now().strftime('%H:%M')}\n\n"
-      "При завершении смены бот рассчитает отработанные часы и начислит положенные обеденные.",
+      "При завершении смены бот рассчитает отработанные часы и начислит обеденные.",
       parse_mode="HTML",
   )
 
@@ -468,7 +472,7 @@ async def cb_end_shift(callback: types.CallbackQuery):
   if remaining_payout > 0:
     msg += f"💰 Начислено к выплате: <b>{remaining_payout:,.0f} ₸</b>"
   else:
-    msg += "👌 Все обеденные были получены ранее."
+    msg += "👌 Все положенные обеденные уже были учтены."
 
   await callback.message.edit_text(msg, parse_mode="HTML")
 
@@ -571,7 +575,7 @@ async def cb_pay_person(callback: types.CallbackQuery):
   await render_admin_menu(callback)
 
 
-# --- ОБРАБОТКА ЧЕКОВ (ФОТО) ЧЕРЕЗ GEMINI ---
+# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ЧЕРЕЗ КАСКАД МОДЕЛЕЙ ИИ ---
 
 
 @dp.message(F.photo)
@@ -595,16 +599,35 @@ async def handle_photo(message: types.Message):
     Отвечай ТОЛЬКО валидным JSON без markdown.
     """
 
-  try:
-    response = ai_client.models.generate_content(
-        model="gemini-3.6-flash",
-        contents=[
-            genai_types.Part.from_bytes(
-                data=image_bytes, mime_type="image/jpeg"
-            ),
-            prompt,
-        ],
+  response = None
+
+  # Пробегаем по моделям при сбое
+  for model_name in AI_MODELS_CASCADE:
+    try:
+      resp = ai_client.models.generate_content(
+          model=model_name,
+          contents=[
+              genai_types.Part.from_bytes(
+                  data=image_bytes, mime_type="image/jpeg"
+              ),
+              prompt,
+          ],
+      )
+      if resp and resp.text:
+        response = resp
+        break
+    except Exception as e:
+      print(f"Модель {model_name} временно недоступна ({e}). Переключаюсь...")
+      await asyncio.sleep(0.5)
+      continue
+
+  if not response or not response.text:
+    await status_msg.edit_text(
+        "⚠️ Все серверы ИИ сейчас временно перегружены. Попробуйте еще раз через 20–30 секунд."
     )
+    return
+
+  try:
     raw = response.text.strip()
     if raw.startswith("```json"):
       raw = raw[7:]
@@ -616,7 +639,7 @@ async def handle_photo(message: types.Message):
     data = json.loads(raw.strip())
     amount = data.get("amount", 0)
 
-    # Определяем официальное имя сотрудника и регистрируем при необходимости
+    # Определяем официальное имя сотрудника и регистрируем, если он новый
     employee = get_or_register_employee(message.from_user)
 
     pending_receipts[message.from_user.id] = {
@@ -629,11 +652,7 @@ async def handle_photo(message: types.Message):
 
     projects = get_active_projects()
     kb_buttons = [
-        [
-            InlineKeyboardButton(
-                text=f"📌 {p}", callback_data=f"proj_{p[:25]}"
-            )
-        ]
+        [InlineKeyboardButton(text=f"📌 {p}", callback_data=f"proj_{p[:25]}")]
         for p in projects
     ]
     if "Склад / Общее" not in projects:
@@ -652,7 +671,7 @@ async def handle_photo(message: types.Message):
         parse_mode="HTML",
     )
   except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка обработки чека: {e}")
+    await status_msg.edit_text(f"⚠️ Ошибка разбора чека: {e}")
 
 
 @dp.callback_query(F.data.startswith("proj_"))
@@ -695,7 +714,7 @@ async def process_project_choice(callback: types.CallbackQuery):
     await status_update.edit_text(f"⚠️ Ошибка записи: {e}")
 
 
-# --- ВЕБ-СЕРВЕР ДЛЯ ОБЛАКА И ТОЧКА ВХОДА ---
+# --- ВЕБ-СЕРВЕР И ТОЧКА ВХОДА ДЛЯ RENDER ---
 
 
 async def handle_ping(request):
