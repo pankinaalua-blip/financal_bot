@@ -36,7 +36,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Каскад моделей: если первая перегружена (ошибка 503), автоматически подхватит следующая
+# Каскад моделей при перегрузках (ошибка 503)
 AI_MODELS_CASCADE = [
     "gemini-3.6-flash",
     "gemini-2.5-flash",
@@ -54,9 +54,19 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-# Временная память для загрузки чеков и активных смен
+# Временная память состояний
 pending_receipts = {}
 active_shifts = {}
+waiting_for_requisites = {}
+
+NAV_BUTTONS = [
+    "📸 Как отправить чек",
+    "🍔 Обеденные (2 500 ₸)",
+    "⏱ Моя смена",
+    "💰 Мои чеки",
+    "💳 Мои реквизиты",
+    "💼 Панель выплат (Admin)",
+]
 
 
 # --- АВТОРЕГИСТРАЦИЯ И СИНХРОНИЗАЦИЯ СОТРУДНИКОВ ---
@@ -91,7 +101,6 @@ def get_or_register_employee(user: types.User) -> str:
         official_name = name
         break
 
-    # Если в справочнике нет — вносим нового сотрудника
     if not official_name:
       official_name = full_name
       ws_ref.append_row([
@@ -103,7 +112,7 @@ def get_or_register_employee(user: types.User) -> str:
       ])
       print(f"➕ Новый сотрудник '{official_name}' добавлен в 'Справочники'")
   except Exception as e:
-    print(f"Ошибка чтения/записи 'Справочников': {e}")
+    print(f"Ошибка 'Справочников': {e}")
     official_name = full_name
 
   # 2. Проверка и добавление в лист 'Выплаты команде'
@@ -129,11 +138,53 @@ def get_or_register_employee(user: types.User) -> str:
   return official_name
 
 
+def get_employee_requisites(employee_name: str) -> str:
+  """Считывает реквизиты из листа 'Выплаты команде' (колонка C)"""
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    rows = ws_pay.get_all_values()
+    for row in rows[1:]:
+      if (
+          len(row) >= 3
+          and (
+              employee_name.lower() in row[0].strip().lower()
+              or row[0].strip().lower() in employee_name.lower()
+          )
+          and row[0].strip()
+      ):
+        reqs = row[2].strip()
+        return reqs if reqs and reqs != "-" else "Реквизиты еще не указаны"
+  except Exception as e:
+    print(f"Ошибка чтения реквизитов: {e}")
+  return "Реквизиты еще не указаны"
+
+
+def save_employee_requisites(employee_name: str, requisites_text: str):
+  """Сохраняет реквизиты в лист 'Выплаты команде' (колонка C)"""
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    col_names = ws_pay.col_values(1)
+
+    matched_idx = None
+    for idx, name in enumerate(col_names, start=1):
+      if (
+          employee_name.lower() in name.lower()
+          or name.lower() in employee_name.lower()
+      ) and name.strip():
+        matched_idx = idx
+        break
+
+    if matched_idx:
+      ws_pay.update_cell(matched_idx, 3, requisites_text)
+      print(f"✅ Реквизиты для {employee_name} сохранены в строку {matched_idx}")
+  except Exception as e:
+    print(f"Ошибка сохранения реквизитов: {e}")
+
+
 # --- ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ---
 
 
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
-  """Создает главное меню с разделением прав доступа"""
   keyboard = [
       [
           KeyboardButton(text="📸 Как отправить чек"),
@@ -143,6 +194,7 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
           KeyboardButton(text="⏱ Моя смена"),
           KeyboardButton(text="💰 Мои чеки"),
       ],
+      [KeyboardButton(text="💳 Мои реквизиты")],
   ]
   if user_id in ADMIN_IDS:
     keyboard.append([KeyboardButton(text="💼 Панель выплат (Admin)")])
@@ -151,7 +203,6 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
 
 
 def get_active_projects():
-  """Считывает список проектов в статусе 'В работе'"""
   try:
     ws = spreadsheet.worksheet("Проекты")
     rows = ws.get_all_records()
@@ -173,7 +224,6 @@ def log_expense(
     comment: str,
     check_type: str = "Норматив (без чека)",
 ):
-  """Универсальная запись расхода в лист 'Операции'"""
   employee = get_or_register_employee(user)
   ws = spreadsheet.worksheet("Операции")
   tx_id = f"TX-{random.randint(10000, 99999)}"
@@ -194,7 +244,6 @@ def log_expense(
 
 
 def get_debts_summary():
-  """Подсчет долгов по всем сотрудникам с адаптивным поиском колонок"""
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
   debts = {}
@@ -221,7 +270,6 @@ def get_debts_summary():
 
 
 def get_user_pending_receipts(user: types.User):
-  """Поиск невозмещенных расходов конкретного сотрудника"""
   employee_name = get_or_register_employee(user)
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
@@ -269,13 +317,24 @@ def get_user_pending_receipts(user: types.User):
 async def cmd_start(message: types.Message):
   name = get_or_register_employee(message.from_user)
   kb = get_main_keyboard(message.from_user.id)
+  reqs = get_employee_requisites(name)
+
+  extra_text = ""
+  if reqs == "Реквизиты еще не указаны":
+    extra_text = (
+        "\n\n💡 <b>Важно:</b> Пожалуйста, нажмите кнопку «💳 Мои реквизиты» и"
+        " укажите ваш номер Kaspi и ИИН для переводов!"
+    )
+
   await message.answer(
       f"Привет, {name}! 🎛️\n\n"
       "Я бот для учета расходов на площадках.\n"
       "• Отправь фото чека для распознавания\n"
       "• Жми «🍔 Обеденные» для суточных 2 500 ₸\n"
-      "• Или запускай «⏱ Моя смена» для автоматического учета времени.",
+      "• Или запускай «⏱ Моя смена» для автоматического учета времени."
+      f"{extra_text}",
       reply_markup=kb,
+      parse_mode="HTML",
   )
 
 
@@ -283,8 +342,8 @@ async def cmd_start(message: types.Message):
 async def msg_how_to(message: types.Message):
   await message.answer(
       "📷 <b>Как отправить чек:</b>\n\n"
-      "1. Нажмите на скрепку и отправьте фото чека (или скриншот из Kaspi / Яндекс Go).\n"
-      "2. ИИ автоматически определит сумму и статью расхода.\n"
+      "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс Go).\n"
+      "2. Gemini автоматически определит сумму и категорию расхода.\n"
       "3. Выберите проект кнопкой.\n\n"
       "Сумма сразу добавится к вашим выплатам!",
       parse_mode="HTML",
@@ -312,6 +371,46 @@ async def msg_my_receipts(message: types.Message):
     text += f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
 
   await status_wait.edit_text(text, parse_mode="HTML")
+
+
+# --- РАБОТА С РЕКВИЗИТАМИ ---
+
+
+@dp.message(F.text == "💳 Мои реквизиты")
+async def cmd_my_requisites(message: types.Message):
+  employee = get_or_register_employee(message.from_user)
+  reqs = get_employee_requisites(employee)
+
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[[
+          InlineKeyboardButton(
+              text="✏️ Изменить / Ввести реквизиты", callback_data="edit_reqs"
+          )
+      ]]
+  )
+  await message.answer(
+      f"💳 <b>Реквизиты для выплат:</b>\n\n"
+      f"👤 <b>Сотрудник:</b> {employee}\n"
+      f"📋 <b>Данные:</b>\n<code>{reqs}</code>\n\n"
+      "<i>По этим реквизитам администратор переводит вам деньги за чеки и обеденные.</i>",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data == "edit_reqs")
+async def cb_edit_requisites(callback: types.CallbackQuery):
+  user_id = callback.from_user.id
+  waiting_for_requisites[user_id] = True
+
+  await callback.message.edit_text(
+      "📝 <b>Введите ваши реквизиты одним сообщением:</b>\n\n"
+      "Укажите номер перевода Kaspi, ИИН и номер карты.\n\n"
+      "Пример:\n"
+      "<code>+7 777 123 4567 (Kaspi)\nИИН: 990102350444\nКарта: 4400 4301 9876 5432</code>\n\n"
+      "Отправьте данные текстом прямо в этот чат:",
+      parse_mode="HTML",
+  )
 
 
 # --- ОБЕДЕННЫЕ И ТАЙМ-ТРЕКЕР СМЕН ---
@@ -513,7 +612,7 @@ async def render_admin_menu(event_target):
       buttons.append([
           InlineKeyboardButton(
               text=f"💸 Погасить: {person} ({sum_amt:,.0f} ₸)",
-              callback_data=f"pay_{person[:30]}",
+              callback_data=f"pay_{person[:25]}",
           )
       ])
     buttons.append(
@@ -539,13 +638,56 @@ async def cb_admin_refresh(callback: types.CallbackQuery):
 
 
 @dp.callback_query(F.data.startswith("pay_"))
-async def cb_pay_person(callback: types.CallbackQuery):
+async def cb_pay_person_preview(callback: types.CallbackQuery):
+  """Этап 1: Просмотр суммы и реквизитов сотрудника перед переводом"""
   if callback.from_user.id not in ADMIN_IDS:
     await callback.answer("Нет прав доступа", show_alert=True)
     return
 
-  person = callback.data.replace("pay_", "")
-  await callback.answer(f"Погашаю: {person}...", show_alert=False)
+  person_prefix = callback.data.replace("pay_", "")
+  debts = get_debts_summary()
+
+  # Находим полное имя человека
+  full_person_name = next(
+      (p for p in debts if p.startswith(person_prefix)), person_prefix
+  )
+  amount = debts.get(full_person_name, 0.0)
+  reqs = get_employee_requisites(full_person_name)
+
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=f"✅ Переведено {amount:,.0f} ₸ (Списать долг)",
+                  callback_data=f"confirmpay_{person_prefix[:20]}",
+              )
+          ],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_refresh")],
+      ]
+  )
+
+  await callback.message.edit_text(
+      f"💼 <b>Окно выплаты сотруднику</b>\n\n"
+      f"👤 <b>Сотрудник:</b> {full_person_name}\n"
+      f"💵 <b>Сумма к переводу:</b> <code>{amount:,.0f}</code> ₸\n\n"
+      f"📋 <b>Реквизиты для Kaspi / Банка:</b>\n"
+      f"<code>{reqs}</code>\n\n"
+      "<i>1. Скопируйте данные и сделайте перевод в приложении Kaspi.\n"
+      "2. Нажмите зеленую кнопку подтверждения ниже, чтобы закрыть долг в таблице.</i>",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("confirmpay_"))
+async def cb_confirm_payment(callback: types.CallbackQuery):
+  """Этап 2: Подтверждение перевода и списание чеков в таблице"""
+  if callback.from_user.id not in ADMIN_IDS:
+    await callback.answer("Нет прав доступа", show_alert=True)
+    return
+
+  person_prefix = callback.data.replace("confirmpay_", "")
+  await callback.answer("Списываю долг в таблице...", show_alert=False)
 
   ws = spreadsheet.worksheet("Операции")
   all_values = ws.get_all_values()
@@ -568,11 +710,33 @@ async def cb_pay_person(callback: types.CallbackQuery):
       status_val = row[status_col_idx - 1].strip().lower()
 
       if (
-          person.lower() in who_val.lower() or who_val.lower() in person.lower()
+          person_prefix.lower() in who_val.lower()
+          or who_val.lower() in person_prefix.lower()
       ) and "к возмещению" in status_val:
         ws.update_cell(row_idx, status_col_idx, "Выплачено")
 
   await render_admin_menu(callback)
+
+
+# --- ПЕРЕХВАТ ВВОДА РЕКВИЗИТОВ ТЕКСТОМ ---
+
+
+@dp.message(F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS))
+async def handle_user_text_input(message: types.Message):
+  user_id = message.from_user.id
+  if user_id in waiting_for_requisites:
+    del waiting_for_requisites[user_id]
+    employee = get_or_register_employee(message.from_user)
+    save_employee_requisites(employee, message.text.strip())
+
+    await message.answer(
+        f"✅ <b>Реквизиты сохранены!</b>\n\n"
+        f"👤 {employee}\n"
+        f"📋 <b>Ваши данные:</b>\n<code>{message.text.strip()}</code>\n\n"
+        "Теперь при выплатах администратор будет сразу видеть эти реквизиты.",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML",
+    )
 
 
 # --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ЧЕРЕЗ КАСКАД МОДЕЛЕЙ ИИ ---
@@ -601,7 +765,6 @@ async def handle_photo(message: types.Message):
 
   response = None
 
-  # Пробегаем по моделям при сбое
   for model_name in AI_MODELS_CASCADE:
     try:
       resp = ai_client.models.generate_content(
@@ -639,7 +802,6 @@ async def handle_photo(message: types.Message):
     data = json.loads(raw.strip())
     amount = data.get("amount", 0)
 
-    # Определяем официальное имя сотрудника и регистрируем, если он новый
     employee = get_or_register_employee(message.from_user)
 
     pending_receipts[message.from_user.id] = {
