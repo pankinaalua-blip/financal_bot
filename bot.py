@@ -19,7 +19,6 @@ from aiohttp import web
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
-from google.oauth2.service_account import Credentials
 import gspread
 
 # 1. Загрузка переменных окружения
@@ -39,17 +38,12 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Строго модель 3.6
+# Модель 3.6
 AUDIO_MODEL = "gemini-3.6-flash"
 IMAGE_MODEL = "gemini-3.6-flash"
 
-# 3. Подключение к Google Таблицам
-SCOPES = [
-    "[https://www.googleapis.com/auth/spreadsheets](https://www.googleapis.com/auth/spreadsheets)",
-    "[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)",
-]
-creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
-gc = gspread.authorize(creds)
+# 3. Безопасное подключение к Google Таблицам со встроенными scopes
+gc = gspread.service_account(filename="credentials.json")
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
 employee_cache = {}
@@ -873,7 +867,6 @@ async def render_project_card(target, data: dict):
     await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
-# Функция распознавания аудио через gemini-3.6-flash
 async def handle_voice_processing(
     message: types.Message, state: FSMContext, voice_obj
 ):
@@ -919,7 +912,6 @@ async def handle_voice_processing(
       )
       return
 
-    # Надежная очистка JSON от Markdown
     raw = resp.text.strip()
     start = raw.find("{")
     end = raw.rfind("}") + 1
@@ -946,7 +938,6 @@ async def handle_voice_processing(
     )
 
 
-# Обработка голосового по кнопке
 @dp.message(VoiceProjectState.waiting_for_voice, F.voice | F.audio)
 async def process_voice_project_state(
     message: types.Message, state: FSMContext
@@ -955,7 +946,6 @@ async def process_voice_project_state(
   await handle_voice_processing(message, state, voice_obj)
 
 
-# Прием голосового от администратора НАПРЯМУЮ в чат (без нажатия кнопки)
 @dp.message(F.from_user.id.in_(ADMIN_IDS), F.voice | F.audio)
 async def process_voice_project_direct(
     message: types.Message, state: FSMContext
