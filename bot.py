@@ -39,7 +39,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Модель 3.6 во главе каскада
+# Модели ИИ
 AUDIO_MODELS_CASCADE = [
     "gemini-3.6-flash",
     "gemini-2.5-flash",
@@ -64,7 +64,8 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-# Память состояний
+# Память состояний и кэш
+employee_cache = {}  # Кэш сотрудников для устранения задержек
 pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
@@ -86,11 +87,14 @@ NAV_BUTTONS = [
 ]
 
 
-# --- АВТОРЕГИСТРАЦИЯ И СИНХРОНИЗАЦИЯ СОТРУДНИКОВ ---
+# --- СИНХРОНИЗАЦИЯ СОТРУДНИКОВ С КЭШЕМ ---
 
 
-def get_or_register_employee(user: types.User) -> str:
+def get_or_register_employee_sync(user: types.User) -> str:
   user_id_str = str(user.id).strip()
+  if user_id_str in employee_cache:
+    return employee_cache[user_id_str]
+
   username_str = f"@{user.username.lower().strip()}" if user.username else ""
   full_name = (user.full_name or "Новый сотрудник").strip()
   official_name = None
@@ -120,12 +124,7 @@ def get_or_register_employee(user: types.User) -> str:
           f"@{user.username}" if user.username else "-",
           user_id_str,
       ])
-      print(f"➕ Новый сотрудник '{official_name}' добавлен в 'Справочники'")
-  except Exception as e:
-    print(f"Ошибка чтения 'Справочников': {e}")
-    official_name = full_name
 
-  try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
 
@@ -133,21 +132,27 @@ def get_or_register_employee(user: types.User) -> str:
       next_row = len(col_names) + 1
       formula_debt = f'=SUMIFS(Операции!F:F; Операции!G:G; A{next_row}; Операции!H:H; "К возмещению")'
       formula_paid = f'=SUMIFS(Операции!F:F; Операции!G:G; A{next_row}; Операции!H:H; "Выплачено")'
-
       ws_pay.append_row(
           [official_name, "Команда", "-", formula_debt, formula_paid],
           value_input_option="USER_ENTERED",
       )
-      print(
-          f"➕ Сотрудник '{official_name}' добавлен в 'Выплаты команде' с формулами"
-      )
-  except Exception as e:
-    print(f"Ошибка проверки 'Выплат': {e}")
 
+  except Exception as e:
+    print(f"Ошибка синхронизации сотрудника: {e}")
+    official_name = official_name or full_name
+
+  employee_cache[user_id_str] = official_name
   return official_name
 
 
-def get_employee_requisites(employee_name: str) -> str:
+async def get_or_register_employee(user: types.User) -> str:
+  user_id_str = str(user.id).strip()
+  if user_id_str in employee_cache:
+    return employee_cache[user_id_str]
+  return await asyncio.to_thread(get_or_register_employee_sync, user)
+
+
+def get_employee_requisites_sync(employee_name: str) -> str:
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     rows = ws_pay.get_all_values()
@@ -169,7 +174,7 @@ def get_employee_requisites(employee_name: str) -> str:
   return "Реквизиты еще не указаны"
 
 
-def save_employee_requisites(employee_name: str, requisites_text: str):
+def save_employee_requisites_sync(employee_name: str, requisites_text: str):
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
@@ -188,7 +193,6 @@ def save_employee_requisites(employee_name: str, requisites_text: str):
       if clean_text.startswith(("+", "=")):
         clean_text = "'" + clean_text
       ws_pay.update_cell(matched_idx, 3, clean_text)
-      print(f"✅ Реквизиты для {employee_name} сохранены в строку {matched_idx}")
   except Exception as e:
     print(f"Ошибка сохранения реквизитов: {e}")
 
@@ -214,7 +218,7 @@ def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
   return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-def get_active_projects():
+def get_active_projects_sync():
   try:
     ws = spreadsheet.worksheet("Проекты")
     rows = ws.get_all_records()
@@ -228,7 +232,7 @@ def get_active_projects():
     return ["Склад / Общее"]
 
 
-def log_expense(
+def log_expense_sync(
     project: str,
     category: str,
     amount: float,
@@ -236,7 +240,7 @@ def log_expense(
     comment: str,
     check_type: str = "Норматив (без чека)",
 ):
-  employee = get_or_register_employee(user)
+  employee = get_or_register_employee_sync(user)
   ws = spreadsheet.worksheet("Операции")
   tx_id = f"TX-{random.randint(10000, 99999)}"
   now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
@@ -255,7 +259,7 @@ def log_expense(
   ])
 
 
-def check_for_duplicate_receipt(
+def check_for_duplicate_receipt_sync(
     employee: str, amount: float, merchant: str
 ) -> dict | None:
   try:
@@ -299,7 +303,7 @@ def check_for_duplicate_receipt(
 async def show_project_selection(
     target_msg, amount: float, merchant: str, data: dict, employee: str
 ):
-  projects = get_active_projects()
+  projects = await asyncio.to_thread(get_active_projects_sync)
   kb_buttons = [
       [InlineKeyboardButton(text=f"📌 {p}", callback_data=f"proj_{p[:25]}")]
       for p in projects
@@ -332,14 +336,13 @@ async def show_project_selection(
     )
 
 
-def get_debts_summary():
+def get_debts_summary_sync():
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
   debts = {}
 
   for r in rows:
     status, who, amount_raw = "", "", 0
-
     for k, v in r.items():
       k_lower = str(k).lower()
       if "статус" in k_lower:
@@ -358,8 +361,8 @@ def get_debts_summary():
   return debts
 
 
-def get_user_pending_receipts(user: types.User):
-  employee_name = get_or_register_employee(user)
+def get_user_pending_receipts_sync(user: types.User):
+  employee_name = get_or_register_employee_sync(user)
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
   user_items = []
@@ -399,14 +402,14 @@ def get_user_pending_receipts(user: types.User):
   return employee_name, total, user_items
 
 
-# --- ОБРАБОТЧИКИ МЕНЮ И КОМАНД ---
+# --- ОБРАБОТЧИКИ КОМАНД И КНОПОК ---
 
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-  name = get_or_register_employee(message.from_user)
+  name = await get_or_register_employee(message.from_user)
   kb = get_main_keyboard(message.from_user.id)
-  reqs = get_employee_requisites(name)
+  reqs = await asyncio.to_thread(get_employee_requisites_sync, name)
 
   extra_text = ""
   if reqs == "Реквизиты еще не указаны":
@@ -443,7 +446,9 @@ async def msg_how_to(message: types.Message):
 @dp.message(F.text == "💰 Мои чеки")
 async def msg_my_receipts(message: types.Message):
   status_wait = await message.answer("🔍 Проверяю ваши чеки в таблице...")
-  name, total, items = get_user_pending_receipts(message.from_user)
+  name, total, items = await asyncio.to_thread(
+      get_user_pending_receipts_sync, message.from_user
+  )
 
   if not items:
     await status_wait.edit_text(
@@ -466,13 +471,10 @@ async def msg_my_receipts(message: types.Message):
   await status_wait.edit_text(text, parse_mode="HTML")
 
 
-# --- РАБОТА С РЕКВИЗИТАМИ ---
-
-
 @dp.message(F.text == "💳 Мои реквизиты")
 async def cmd_my_requisites(message: types.Message):
-  employee = get_or_register_employee(message.from_user)
-  reqs = get_employee_requisites(employee)
+  employee = await get_or_register_employee(message.from_user)
+  reqs = await asyncio.to_thread(get_employee_requisites_sync, employee)
 
   kb = InlineKeyboardMarkup(
       inline_keyboard=[[
@@ -494,6 +496,7 @@ async def cmd_my_requisites(message: types.Message):
 
 @dp.callback_query(F.data == "edit_reqs")
 async def cb_edit_requisites(callback: types.CallbackQuery):
+  await callback.answer()
   user_id = callback.from_user.id
   waiting_for_requisites[user_id] = True
 
@@ -508,12 +511,12 @@ async def cb_edit_requisites(callback: types.CallbackQuery):
   )
 
 
-# --- ОБЕДЕННЫЕ И ТАЙМ-ТРЕКЕР СМЕН ---
+# --- ОБЕДЕННЫЕ И СМЕНЫ ---
 
 
 @dp.message(F.text == "🍔 Обеденные (2 500 ₸)")
 async def cmd_quick_meal(message: types.Message):
-  projects = get_active_projects()
+  projects = await asyncio.to_thread(get_active_projects_sync)
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
           [InlineKeyboardButton(text=p, callback_data=f"meal_{p[:25]}")]
@@ -529,22 +532,24 @@ async def cmd_quick_meal(message: types.Message):
 
 @dp.callback_query(F.data.startswith("meal_"))
 async def cb_confirm_meal(callback: types.CallbackQuery):
+  await callback.answer("Записываю обеденные...")
   project_short = callback.data.replace("meal_", "")
+  projects = await asyncio.to_thread(get_active_projects_sync)
   full_project = next(
-      (p for p in get_active_projects() if p.startswith(project_short)),
-      "Склад / Общее",
+      (p for p in projects if p.startswith(project_short)), "Склад / Общее"
   )
 
   user_id = callback.from_user.id
   if user_id in active_shifts:
     active_shifts[user_id]["claimed_meals"] += 1
 
-  log_expense(
-      project=full_project,
-      category="Питание команды",
-      amount=2500,
-      user=callback.from_user,
-      comment="Обеденные (быстрая выплата)",
+  await asyncio.to_thread(
+      log_expense_sync,
+      full_project,
+      "Питание команды",
+      2500,
+      callback.from_user,
+      "Обеденные (быстрая выплата)",
   )
 
   await callback.message.edit_text(
@@ -560,7 +565,7 @@ async def cmd_shift_menu(message: types.Message):
   user_id = message.from_user.id
 
   if user_id not in active_shifts:
-    projects = get_active_projects()
+    projects = await asyncio.to_thread(get_active_projects_sync)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -611,11 +616,12 @@ async def cmd_shift_menu(message: types.Message):
 
 @dp.callback_query(F.data.startswith("startshift_"))
 async def cb_start_shift(callback: types.CallbackQuery):
+  await callback.answer()
   user_id = callback.from_user.id
   proj_prefix = callback.data.replace("startshift_", "")
+  projects = await asyncio.to_thread(get_active_projects_sync)
   full_project = next(
-      (p for p in get_active_projects() if p.startswith(proj_prefix)),
-      "Склад / Общее",
+      (p for p in projects if p.startswith(proj_prefix)), "Склад / Общее"
   )
 
   active_shifts[user_id] = {
@@ -641,6 +647,7 @@ async def cb_end_shift(callback: types.CallbackQuery):
     await callback.answer("Смена не найдена", show_alert=True)
     return
 
+  await callback.answer("Завершаю смену...")
   shift = active_shifts.pop(user_id)
   duration = datetime.now() - shift["start_time"]
   hours = duration.total_seconds() / 3600
@@ -651,12 +658,13 @@ async def cb_end_shift(callback: types.CallbackQuery):
   remaining_payout = remaining_meals * 2500
 
   if remaining_payout > 0:
-    log_expense(
-        project=shift["project"],
-        category="Питание команды",
-        amount=remaining_payout,
-        user=callback.from_user,
-        comment=f"Обеденные за смену ({int(hours)} ч, остаток)",
+    await asyncio.to_thread(
+        log_expense_sync,
+        shift["project"],
+        "Питание команды",
+        remaining_payout,
+        callback.from_user,
+        f"Обеденные за смену ({int(hours)} ч, остаток)",
     )
 
   msg = (
@@ -674,7 +682,7 @@ async def cb_end_shift(callback: types.CallbackQuery):
   await callback.message.edit_text(msg, parse_mode="HTML")
 
 
-# --- ПАНЕЛЬ УПРАВЛЕНИЯ (ADMIN) И ГОЛОСОВОЙ ВВОД С ДАТОЙ ---
+# --- ПАНЕЛЬ ADMIN И ГОЛОС ---
 
 
 @dp.message(F.text == "💼 Панель выплат (Admin)")
@@ -687,7 +695,7 @@ async def admin_panel_handler(message: types.Message):
 
 
 async def render_admin_menu(event_target):
-  debts = get_debts_summary()
+  debts = await asyncio.to_thread(get_debts_summary_sync)
   total_debt = sum(debts.values()) if debts else 0
 
   text = (
@@ -722,6 +730,7 @@ async def render_admin_menu(event_target):
 
 @dp.callback_query(F.data == "admin_hub")
 async def cb_admin_hub(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
   if callback.from_user.id not in ADMIN_IDS:
     return
   await state.clear()
@@ -732,8 +741,8 @@ async def cb_admin_hub(callback: types.CallbackQuery, state: FSMContext):
 async def cb_start_voice_project(
     callback: types.CallbackQuery, state: FSMContext
 ):
+  await callback.answer()
   if callback.from_user.id not in ADMIN_IDS:
-    await callback.answer("Нет прав доступа", show_alert=True)
     return
 
   await state.set_state(VoiceProjectState.waiting_for_voice)
@@ -799,7 +808,7 @@ async def render_project_card(target, data: dict):
 
 @dp.message(VoiceProjectState.waiting_for_voice, F.voice)
 async def process_voice_project(message: types.Message, state: FSMContext):
-  status_msg = await message.answer("🎧 Вслушиваюсь в голосовое (3.6)...")
+  status_msg = await message.answer("🎧 Вслушиваюсь в голосовое...")
 
   voice = message.voice
   file_io = io.BytesIO()
@@ -826,13 +835,13 @@ async def process_voice_project(message: types.Message, state: FSMContext):
        - если сказали "полная оплата", "100%", "оплатили всё" -> 100
        - если не упомянули или сказали "без предоплаты" -> 0
 
-    Верни СТРОГО JSON следующей структуры:
+    Верни СТРОГО JSON:
     {
-      "transcript": "дословный текст того, что надиктовал администратор",
-      "event_date": "дата в формате ДД.ММ",
-      "project_name": "название события, заказчика или артиста БЕЗ даты",
-      "location": "площадка, ресторан или локация (например: Отель Sheraton, Дворец Спорта, Rixos)",
-      "price": сумма сметы числом (например: 1500000),
+      "transcript": "текст",
+      "event_date": "дата ДД.ММ",
+      "project_name": "название БЕЗ даты",
+      "location": "площадка",
+      "price": сумма числом,
       "prepay_percent": 0, 50 или 100
     }
     """
@@ -857,41 +866,31 @@ async def process_voice_project(message: types.Message, state: FSMContext):
         response = resp
         break
     except Exception as e:
-      print(f"Модель {model_name} временно недоступна для аудио ({e})...")
+      print(f"Модель {model_name} пропущена ({e})...")
       continue
 
   if not response or not response.text:
-    await status_msg.edit_text(
-        "⚠️ Не удалось разобрать аудио. Попробуйте наговорить еще раз четче."
-    )
+    await status_msg.edit_text("⚠️ Не удалось разобрать аудио. Попробуйте еще.")
     return
 
   try:
     data = json.loads(response.text.strip())
-    transcript = data.get("transcript", "")
-    event_date = data.get("event_date", datetime.now().strftime("%d.%m"))
-    proj_name = data.get("project_name", "Мероприятие")
-    location = data.get("location", "Площадка")
-    price = float(data.get("price", 0))
-    prepay_pct = int(data.get("prepay_percent", 0))
-
     await state.update_data(
-        transcript=transcript,
-        event_date=event_date,
-        project_name=proj_name,
-        location=location,
-        price=price,
-        prepay_percent=prepay_pct,
+        transcript=data.get("transcript", ""),
+        event_date=data.get("event_date", datetime.now().strftime("%d.%m")),
+        project_name=data.get("project_name", "Мероприятие"),
+        location=data.get("location", "Площадка"),
+        price=float(data.get("price", 0)),
+        prepay_percent=int(data.get("prepay_percent", 0)),
     )
-
     await render_project_card(status_msg, await state.get_data())
-
   except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка разбора аудио: {e}")
+    await status_msg.edit_text(f"⚠️ Ошибка: {e}")
 
 
 @dp.callback_query(F.data == "edit_voice_fields_menu")
 async def cb_edit_fields_menu(callback: types.CallbackQuery):
+  await callback.answer()
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
           [
@@ -933,30 +932,17 @@ async def cb_edit_fields_menu(callback: types.CallbackQuery):
 async def cb_select_field_to_edit(
     callback: types.CallbackQuery, state: FSMContext
 ):
+  await callback.answer()
   field_name = callback.data.replace("field_", "")
   await state.update_data(editing_target=field_name)
   await state.set_state(VoiceProjectState.editing_field)
 
   prompts = {
-      "event_date": (
-          "Введите правильную <b>дату мероприятия</b> (например:"
-          " <code>25.09</code> или <code>15.10</code>):"
-      ),
-      "project_name": (
-          "Введите правильное <b>название проекта</b> (например: <code>Концерт"
-          " Баста</code>):"
-      ),
-      "location": (
-          "Введите правильную <b>локацию / площадку</b> (например: <code>Отель"
-          " Sheraton</code>):"
-      ),
-      "price": (
-          "Введите правильную <b>сумму сметы числом</b> (например:"
-          " <code>1500000</code>):"
-      ),
-      "prepay_percent": (
-          "Введите процент предоплаты числом <b>(0, 50 или 100)</b>:"
-      ),
+      "event_date": "Введите правильную <b>дату мероприятия</b> (25.09):",
+      "project_name": "Введите правильное <b>название проекта</b>:",
+      "location": "Введите правильную <b>локацию / площадку</b>:",
+      "price": "Введите правильную <b>сумму сметы числом</b> (1500000):",
+      "prepay_percent": "Введите процент предоплаты <b>(0, 50 или 100)</b>:",
   }
   await callback.message.edit_text(
       prompts.get(field_name, "Введите новое значение:"), parse_mode="HTML"
@@ -974,101 +960,101 @@ async def process_field_edit_text(message: types.Message, state: FSMContext):
       val = float(text_val.replace(" ", "").replace(",", "."))
       await state.update_data(price=val)
     except ValueError:
-      await message.answer(
-          "⚠️ Введите сумму числом (например: <code>1500000</code>):",
-          parse_mode="HTML",
-      )
+      await message.answer("⚠️ Введите число:")
       return
   elif field == "prepay_percent":
     try:
       val = int(text_val.replace("%", "").strip())
       await state.update_data(prepay_percent=val)
     except ValueError:
-      await message.answer(
-          "⚠️ Введите 0, 50 или 100:",
-          parse_mode="HTML",
-      )
+      await message.answer("⚠️ Введите 0, 50 или 100:")
       return
   elif field in ["event_date", "project_name", "location"]:
     await state.update_data({field: text_val})
 
   await state.set_state(VoiceProjectState.waiting_for_voice)
   updated_data = await state.get_data()
-  msg_wait = await message.answer("🔄 Обновляю данные карточки...")
+  msg_wait = await message.answer("🔄 Обновляю...")
   await render_project_card(msg_wait, updated_data)
 
 
 @dp.callback_query(F.data == "back_to_card")
 async def cb_back_to_card(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
   data = await state.get_data()
   await render_project_card(callback, data)
+
+
+def add_project_to_sheets_sync(data: dict):
+  ws_proj = spreadsheet.worksheet("Проекты")
+  next_row = len(ws_proj.col_values(1)) + 1
+
+  event_date = data.get("event_date", "").strip()
+  raw_name = data.get("project_name", "").strip()
+
+  if event_date and not raw_name.startswith(event_date):
+    full_proj_name = f"{event_date} {raw_name}"
+  else:
+    full_proj_name = raw_name
+
+  total_price = float(data.get("price", 0))
+  prepay_pct = int(data.get("prepay_percent", 0))
+  paid_amount = total_price * (prepay_pct / 100.0)
+
+  formula_expenses = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
+  formula_profit = f"=E{next_row}-F{next_row}"
+  formula_margin = f"=IF(E{next_row}>0; G{next_row}/E{next_row}; 0)"
+
+  ws_proj.append_row(
+      [
+          full_proj_name,
+          event_date,
+          data.get("location", "Площадка"),
+          "В работе",
+          total_price,
+          formula_expenses,
+          formula_profit,
+          formula_margin,
+      ],
+      value_input_option="USER_ENTERED",
+  )
+
+  if paid_amount > 0:
+    ws_ops = spreadsheet.worksheet("Операции")
+    tx_id = f"TX-{random.randint(10000, 99999)}"
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ws_ops.append_row([
+        tx_id,
+        now_str,
+        "Доход",
+        full_proj_name,
+        "Комплексный продакшн",
+        paid_amount,
+        "Клиент",
+        "Не требуется",
+        "-",
+        f"Предоплата ({prepay_pct}%)",
+    ])
+
+  return full_proj_name, total_price, paid_amount
 
 
 @dp.callback_query(F.data == "confirm_voice_proj")
 async def cb_confirm_voice_proj(
     callback: types.CallbackQuery, state: FSMContext
 ):
+  await callback.answer()
   data = await state.get_data()
   if not data or "project_name" not in data:
-    await callback.answer(
-        "Данные устарели, надиктуйте заново.", show_alert=True
-    )
+    await callback.answer("Данные устарели", show_alert=True)
     return
 
   await callback.message.edit_text("⏳ Записываю проект в Google Таблицу...")
 
   try:
-    ws_proj = spreadsheet.worksheet("Проекты")
-    next_row = len(ws_proj.col_values(1)) + 1
-
-    event_date = data.get("event_date", "").strip()
-    raw_name = data.get("project_name", "").strip()
-
-    if event_date and not raw_name.startswith(event_date):
-      full_proj_name = f"{event_date} {raw_name}"
-    else:
-      full_proj_name = raw_name
-
-    total_price = float(data.get("price", 0))
-    prepay_pct = int(data.get("prepay_percent", 0))
-    paid_amount = total_price * (prepay_pct / 100.0)
-
-    # Формулы листа Проекты строго с точкой с запятой (;):
-    formula_expenses = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
-    formula_profit = f"=E{next_row}-F{next_row}"
-    formula_margin = f"=IF(E{next_row}>0; G{next_row}/E{next_row}; 0)"
-
-    ws_proj.append_row(
-        [
-            full_proj_name,
-            event_date,
-            data.get("location", "Площадка"),
-            "В работе",
-            total_price,
-            formula_expenses,
-            formula_profit,
-            formula_margin,
-        ],
-        value_input_option="USER_ENTERED",
+    full_proj_name, total_price, paid_amount = await asyncio.to_thread(
+        add_project_to_sheets_sync, data
     )
-
-    if paid_amount > 0:
-      ws_ops = spreadsheet.worksheet("Операции")
-      tx_id = f"TX-{random.randint(10000, 99999)}"
-      now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-      ws_ops.append_row([
-          tx_id,
-          now_str,
-          "Доход",
-          full_proj_name,
-          "Комплексный продакшн",
-          paid_amount,
-          "Клиент",
-          "Не требуется",
-          "-",
-          f"Предоплата ({prepay_pct}%)",
-      ])
-
     await state.clear()
 
     kb = InlineKeyboardMarkup(
@@ -1082,11 +1068,10 @@ async def cb_confirm_voice_proj(
     await callback.message.edit_text(
         f"✅ <b>Мероприятие создано!</b>\n\n"
         f"🎯 <b>{full_proj_name}</b>\n"
-        f"📅 Дата: {event_date}\n"
+        f"📅 Дата: {data.get('event_date', '-')}\n"
         f"📍 Локация: {data.get('location', 'Площадка')}\n"
         f"💵 Смета: {total_price:,.0f} ₸\n"
-        f"💰 Предоплата: {paid_amount:,.0f} ₸\n\n"
-        "<i>Проект внесен в таблицу и готов к работе!</i>",
+        f"💰 Предоплата: {paid_amount:,.0f} ₸",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -1099,10 +1084,11 @@ async def cb_confirm_voice_proj(
 
 @dp.callback_query(F.data == "admin_payouts_list")
 async def cb_admin_payouts_list(callback: types.CallbackQuery):
+  await callback.answer()
   if callback.from_user.id not in ADMIN_IDS:
     return
 
-  debts = get_debts_summary()
+  debts = await asyncio.to_thread(get_debts_summary_sync)
   buttons = []
 
   if not debts:
@@ -1135,18 +1121,18 @@ async def cb_admin_payouts_list(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pay_"))
 async def cb_pay_person_preview(callback: types.CallbackQuery):
+  await callback.answer()
   if callback.from_user.id not in ADMIN_IDS:
-    await callback.answer("Нет прав доступа", show_alert=True)
     return
 
   person_prefix = callback.data.replace("pay_", "")
-  debts = get_debts_summary()
+  debts = await asyncio.to_thread(get_debts_summary_sync)
 
   full_person_name = next(
       (p for p in debts if p.startswith(person_prefix)), person_prefix
   )
   amount = debts.get(full_person_name, 0.0)
-  reqs = get_employee_requisites(full_person_name)
+  reqs = await asyncio.to_thread(get_employee_requisites_sync, full_person_name)
 
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -1169,24 +1155,13 @@ async def cb_pay_person_preview(callback: types.CallbackQuery):
       f"👤 <b>Сотрудник:</b> {full_person_name}\n"
       f"💵 <b>Сумма к переводу:</b> <code>{amount:,.0f}</code> ₸\n\n"
       f"📋 <b>Реквизиты для Kaspi / Банка:</b>\n"
-      f"<code>{reqs}</code>\n\n"
-      "<i>1. Скопируйте данные и сделайте перевод в Kaspi.\n"
-      "2. Нажмите зеленую кнопку подтверждения ниже, чтобы закрыть долг в"
-      " таблице.</i>",
+      f"<code>{reqs}</code>",
       reply_markup=kb,
       parse_mode="HTML",
   )
 
 
-@dp.callback_query(F.data.startswith("confirmpay_"))
-async def cb_confirm_payment(callback: types.CallbackQuery):
-  if callback.from_user.id not in ADMIN_IDS:
-    await callback.answer("Нет прав доступа", show_alert=True)
-    return
-
-  person_prefix = callback.data.replace("confirmpay_", "")
-  await callback.answer("Списываю долг в таблице...", show_alert=False)
-
+def close_debt_sync(person_prefix: str):
   ws = spreadsheet.worksheet("Операции")
   all_values = ws.get_all_values()
   if not all_values:
@@ -1213,6 +1188,16 @@ async def cb_confirm_payment(callback: types.CallbackQuery):
       ) and "к возмещению" in status_val:
         ws.update_cell(row_idx, status_col_idx, "Выплачено")
 
+
+@dp.callback_query(F.data.startswith("confirmpay_"))
+async def cb_confirm_payment(callback: types.CallbackQuery):
+  if callback.from_user.id not in ADMIN_IDS:
+    await callback.answer("Нет прав доступа", show_alert=True)
+    return
+
+  await callback.answer("Списываю долг в таблице...")
+  person_prefix = callback.data.replace("confirmpay_", "")
+  await asyncio.to_thread(close_debt_sync, person_prefix)
   await render_admin_menu(callback)
 
 
@@ -1227,14 +1212,15 @@ async def handle_user_text_input(message: types.Message):
   user_id = message.from_user.id
   if user_id in waiting_for_requisites:
     del waiting_for_requisites[user_id]
-    employee = get_or_register_employee(message.from_user)
-    save_employee_requisites(employee, message.text.strip())
+    employee = await get_or_register_employee(message.from_user)
+    await asyncio.to_thread(
+        save_employee_requisites_sync, employee, message.text.strip()
+    )
 
     await message.answer(
         f"✅ <b>Реквизиты сохранены!</b>\n\n"
         f"👤 {employee}\n"
-        f"📋 <b>Ваши данные:</b>\n<code>{message.text.strip()}</code>\n\n"
-        "Теперь при выплатах администратор будет сразу видеть эти данные.",
+        f"📋 <b>Ваши данные:</b>\n<code>{message.text.strip()}</code>",
         reply_markup=get_main_keyboard(user_id),
         parse_mode="HTML",
     )
@@ -1249,9 +1235,7 @@ async def handle_photo(message: types.Message):
 
   if photo.file_unique_id in saved_receipt_file_ids:
     await message.answer(
-        "⚠️ <b>Этот чек уже был успешно внесен в таблицу ранее!</b> Повторная"
-        " запись отменена.",
-        parse_mode="HTML",
+        "⚠️ <b>Этот чек уже был успешно внесен ранее!</b>", parse_mode="HTML"
     )
     return
 
@@ -1297,8 +1281,7 @@ async def handle_photo(message: types.Message):
 
   if not response or not response.text:
     await status_msg.edit_text(
-        "⚠️ Серверы ИИ сейчас временно перегружены. Пожалуйста, отправьте чек"
-        " еще раз через пару секунд."
+        "⚠️ Серверы ИИ перегружены. Отправьте чек еще раз."
     )
     return
 
@@ -1307,7 +1290,7 @@ async def handle_photo(message: types.Message):
     amount = data.get("amount", 0)
     merchant = data.get("merchant", "Неизвестно")
 
-    employee = get_or_register_employee(message.from_user)
+    employee = await get_or_register_employee(message.from_user)
 
     pending_receipts[message.from_user.id] = {
         "amount": amount,
@@ -1318,7 +1301,9 @@ async def handle_photo(message: types.Message):
         "file_unique_id": photo.file_unique_id,
     }
 
-    duplicate = check_for_duplicate_receipt(employee, float(amount), merchant)
+    duplicate = await asyncio.to_thread(
+        check_for_duplicate_receipt_sync, employee, float(amount), merchant
+    )
     if duplicate:
       kb_dup = InlineKeyboardMarkup(
           inline_keyboard=[
@@ -1341,7 +1326,7 @@ async def handle_photo(message: types.Message):
           f"🕒 Время: {duplicate['time']}\n"
           f"🎯 Проект: {duplicate['project']}\n"
           f"💵 Сумма: {duplicate['amount']:,.0f} ₸ ({merchant})\n\n"
-          "Это точно <b>еще одна</b> отдельная покупка?",
+          "Это точно отдельная покупка?",
           reply_markup=kb_dup,
           parse_mode="HTML",
       )
@@ -1350,15 +1335,16 @@ async def handle_photo(message: types.Message):
     await show_project_selection(status_msg, amount, merchant, data, employee)
 
   except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка разбора чека: {e}")
+    await status_msg.edit_text(f"⚠️ Ошибка: {e}")
 
 
 @dp.callback_query(F.data == "confirm_duplicate_ok")
 async def cb_confirm_duplicate(callback: types.CallbackQuery):
+  await callback.answer()
   user_id = callback.from_user.id
   receipt = pending_receipts.get(user_id)
   if not receipt:
-    await callback.answer("Данные чека устарели", show_alert=True)
+    await callback.answer("Данные устарели", show_alert=True)
     return
 
   await show_project_selection(
@@ -1372,41 +1358,43 @@ async def cb_confirm_duplicate(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data == "cancel_duplicate")
 async def cb_cancel_duplicate(callback: types.CallbackQuery):
+  await callback.answer()
   user_id = callback.from_user.id
   if user_id in pending_receipts:
     del pending_receipts[user_id]
   await callback.message.edit_text(
-      "❌ <b>Загрузка отменена.</b> Дубликат не попал в таблицу.",
-      parse_mode="HTML",
+      "❌ <b>Загрузка отменена.</b>", parse_mode="HTML"
   )
 
 
 @dp.callback_query(F.data.startswith("proj_"))
 async def process_project_choice(callback: types.CallbackQuery):
+  await callback.answer("Записываю чек...")
   project_short = callback.data.replace("proj_", "")
   user_id = callback.from_user.id
   receipt = pending_receipts.get(user_id)
 
   if not receipt:
-    await callback.answer("Данные чека устарели.", show_alert=True)
+    await callback.answer("Данные устарели.", show_alert=True)
     return
 
+  projects = await asyncio.to_thread(get_active_projects_sync)
   full_project = next(
-      (p for p in get_active_projects() if p.startswith(project_short)),
-      "Склад / Общее",
+      (p for p in projects if p.startswith(project_short)), "Склад / Общее"
   )
 
   await callback.message.edit_reply_markup(reply_markup=None)
   status_update = await callback.message.answer("⏳ Записываю в таблицу...")
 
   try:
-    log_expense(
-        project=full_project,
-        category=receipt["category"],
-        amount=float(receipt["amount"]),
-        user=callback.from_user,
-        comment=f"{receipt['merchant']}: {receipt['description']}",
-        check_type="Чек в Telegram",
+    await asyncio.to_thread(
+        log_expense_sync,
+        full_project,
+        receipt["category"],
+        float(receipt["amount"]),
+        callback.from_user,
+        f"{receipt['merchant']}: {receipt['description']}",
+        "Чек в Telegram",
     )
 
     if receipt.get("file_unique_id"):
