@@ -22,6 +22,7 @@ from google import genai
 from google.genai import types as genai_types
 import gspread
 
+# 1. Загрузка переменных окружения
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
@@ -33,12 +34,12 @@ ADMIN_IDS = [
 
 SPREADSHEET_ID = "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA"
 
+# 2. Инициализация Telegram и Google AI
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-AI_MODEL = "gemini-3.6-flash"
-
+# 3. Подключение к Google Таблицам
 gc = gspread.service_account(filename="credentials.json")
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
@@ -47,6 +48,44 @@ pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
 saved_receipt_file_ids = set()
+
+
+# Функция защиты от ошибки 503 (Всегда 3.6 в приоритете + авто-повтор)
+async def call_gemini_safe(contents, json_mode: bool = True):
+  models_cascade = [
+      "gemini-3.6-flash",  # 1-я попытка на 3.6
+      "gemini-3.6-flash",  # Повтор на 3.6 при кратковременном скачке
+      "gemini-2.5-flash",  # Мгновенная подстраховка
+      "gemini-2.0-flash",  # Резерв
+      "gemini-1.5-flash",  # Запасной шлюз
+  ]
+
+  config = (
+      genai_types.GenerateContentConfig(
+          response_mime_type="application/json", temperature=0.1
+      )
+      if json_mode
+      else None
+  )
+
+  for idx, model_name in enumerate(models_cascade):
+    try:
+      resp = ai_client.models.generate_content(
+          model=model_name,
+          contents=contents,
+          config=config,
+      )
+      if resp and resp.text:
+        return resp.text
+    except Exception as e:
+      print(f"Попытка на {model_name} временно не прошла ({e})...")
+      # Если это первый сбой на 3.6, ждем секунду и повторяем
+      if idx == 0:
+        await asyncio.sleep(1.0)
+      else:
+        await asyncio.sleep(0.3)
+      continue
+  return None
 
 
 class ProjectCreationState(StatesGroup):
@@ -219,7 +258,7 @@ def save_employee_requisites_sync(employee_name: str, requisites_text: str):
     print(f"Ошибка сохранения реквизитов: {e}")
 
 
-# --- УМНАЯ ФИЛЬТРАЦИЯ ПРОЕКТОВ (АКТУАЛЬНЫЕ VS ВСЕ) ---
+# --- УМНАЯ ФИЛЬТРАЦИЯ ПРОЕКТОВ ---
 
 
 def get_filtered_projects_sync(show_all: bool = False) -> list[str]:
@@ -244,7 +283,6 @@ def get_filtered_projects_sync(show_all: bool = False) -> list[str]:
         filtered.append(proj)
         continue
 
-      # Парсинг даты из названия проекта вида 25.09
       date_match = re.search(r"\b(\d{1,2})[./](\d{1,2})\b", proj)
       if date_match:
         try:
@@ -252,13 +290,11 @@ def get_filtered_projects_sync(show_all: bool = False) -> list[str]:
           p_date = datetime(current_year, month, day)
           diff_days = (p_date.date() - now.date()).days
 
-          # Показываем прошедшие 3 дня и ближайшие 10 дней
           if -3 <= diff_days <= 10:
             filtered.append(proj)
         except ValueError:
           filtered.append(proj)
       else:
-        # Если дата не указана явно, держим в активных
         filtered.append(proj)
 
     filtered.insert(0, "Склад / Общее")
@@ -346,7 +382,11 @@ async def render_project_keyboard(
 ) -> InlineKeyboardMarkup:
   projects = await asyncio.to_thread(get_filtered_projects_sync, show_all)
   kb_buttons = [
-      [InlineKeyboardButton(text=f"📌 {p}", callback_data=f"{callback_prefix}_{p[:25]}")]
+      [
+          InlineKeyboardButton(
+              text=f"📌 {p}", callback_data=f"{callback_prefix}_{p[:25]}"
+          )
+      ]
       for p in projects
   ]
 
@@ -842,12 +882,12 @@ async def process_fast_expense_details(message: types.Message, state: FSMContext
     """
 
   try:
-    resp = ai_client.models.generate_content(
-        model=AI_MODEL,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
-    )
-    raw = resp.text.strip()
+    resp_text = await call_gemini_safe(prompt, json_mode=True)
+    if not resp_text:
+      await status_msg.edit_text("⚠️ Серверы временно перегружены. Попробуйте еще раз через секунду.")
+      return
+
+    raw = resp_text.strip()
     start = raw.find("{")
     end = raw.rfind("}") + 1
     exp_data = json.loads(raw[start:end])
@@ -950,7 +990,7 @@ async def render_project_card(target, data: dict):
 
 
 async def parse_project_with_gemini(message: types.Message, state: FSMContext, contents):
-  status_msg = await message.answer("🤖 Распознаю проект (Gemini 3.6)...")
+  status_msg = await message.answer("🤖 Распознаю проект (Gemini)...")
   prompt = """
     Ты финансовый ассистент компании аренды сценического оборудования.
     Извлеки данные о проекте и верни ТОЛЬКО валидный JSON:
@@ -968,16 +1008,12 @@ async def parse_project_with_gemini(message: types.Message, state: FSMContext, c
     else:
       parts = [contents, prompt]
 
-    resp = ai_client.models.generate_content(
-        model=AI_MODEL,
-        contents=parts,
-        config=genai_types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.1,
-        ),
-    )
+    resp_text = await call_gemini_safe(parts, json_mode=True)
+    if not resp_text:
+      await status_msg.edit_text("⚠️ Серверы временно перегружены. Попробуйте еще раз.")
+      return
 
-    raw = resp.text.strip()
+    raw = resp_text.strip()
     start = raw.find("{")
     end = raw.rfind("}") + 1
     data = json.loads(raw[start:end])
@@ -1299,7 +1335,7 @@ async def handle_user_text_input(message: types.Message):
     )
 
 
-# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ---
+# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) С ЗАЩИТОЙ ОТ 503 ---
 
 
 @dp.message(F.photo)
@@ -1309,7 +1345,7 @@ async def handle_photo(message: types.Message):
     await message.answer("⚠️ Этот чек уже был успешно внесен ранее!")
     return
 
-  status_msg = await message.answer("🔍 Распознаю чек (Gemini 3.6)...")
+  status_msg = await message.answer("🔍 Распознаю чек...")
   file_io = io.BytesIO()
   await bot.download(photo, destination=file_io)
 
@@ -1325,16 +1361,23 @@ async def handle_photo(message: types.Message):
     """
 
   try:
-    resp = ai_client.models.generate_content(
-        model=AI_MODEL,
-        contents=[
-            genai_types.Part.from_bytes(data=file_io.getvalue(), mime_type="image/jpeg"),
+    resp_text = await call_gemini_safe(
+        [
+            genai_types.Part.from_bytes(
+                data=file_io.getvalue(), mime_type="image/jpeg"
+            ),
             prompt,
         ],
-        config=genai_types.GenerateContentConfig(response_mime_type="application/json"),
+        json_mode=True,
     )
 
-    raw = resp.text.strip()
+    if not resp_text:
+      await status_msg.edit_text(
+          "⚠️ Серверы Google перегружены. Пожалуйста, отправьте чек еще раз через секунду."
+      )
+      return
+
+    raw = resp_text.strip()
     start = raw.find("{")
     end = raw.rfind("}") + 1
     data = json.loads(raw[start:end])
