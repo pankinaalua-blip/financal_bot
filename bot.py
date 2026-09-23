@@ -42,7 +42,7 @@ ai_client = genai.Client(api_key=GEMINI_KEY)
 AUDIO_MODEL = "gemini-3.6-flash"
 IMAGE_MODEL = "gemini-3.6-flash"
 
-# 3. Безопасное подключение к Google Таблицам со встроенными scopes
+# 3. Подключение к Google Таблицам со встроенными scopes
 gc = gspread.service_account(filename="credentials.json")
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
@@ -56,6 +56,11 @@ saved_receipt_file_ids = set()
 class VoiceProjectState(StatesGroup):
   waiting_for_voice = State()
   editing_field = State()
+
+
+class ManualExpenseState(StatesGroup):
+  waiting_for_amount = State()
+  waiting_for_comment = State()
 
 
 NAV_BUTTONS = [
@@ -723,7 +728,7 @@ async def cb_end_shift(callback: types.CallbackQuery):
   await callback.message.edit_text(msg, parse_mode="HTML")
 
 
-# --- ПАНЕЛЬ ADMIN И ГОЛОСОВОЙ ВВОД (GEMINI 3.6) ---
+# --- ПАНЕЛЬ ADMIN, РУЧНОЙ РАСХОД И ГОЛОС (3.6) ---
 
 
 @dp.message(F.text == "💼 Панель выплат (Admin)")
@@ -749,7 +754,10 @@ async def render_admin_menu(event_target):
       [
           InlineKeyboardButton(
               text="🎙 Надиктовать проект", callback_data="admin_voice_project"
-          )
+          ),
+          InlineKeyboardButton(
+              text="💸 Внести расход", callback_data="admin_manual_expense"
+          ),
       ],
       [
           InlineKeyboardButton(
@@ -796,6 +804,221 @@ async def cb_admin_hub(callback: types.CallbackQuery, state: FSMContext):
     return
   await state.clear()
   await render_admin_menu(callback)
+
+
+# --- ПОШАГОВЫЙ РУЧНОЙ ВВОД РАСХОДА БЕЗ ЧЕКА ---
+
+
+@dp.callback_query(F.data == "admin_manual_expense")
+async def cb_start_manual_expense(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer()
+  if callback.from_user.id not in ADMIN_IDS:
+    return
+
+  await state.clear()
+  projects = await asyncio.to_thread(get_active_projects_sync)
+  kb = [
+      [
+          InlineKeyboardButton(
+              text=f"📌 {p}", callback_data=f"mexp_proj_{p[:25]}"
+          )
+      ]
+      for p in projects
+  ]
+  kb.append(
+      [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_hub")]
+  )
+
+  await callback.message.edit_text(
+      "💸 <b>Внесение расхода вручную (без чека)</b>\n\n"
+      "<b>Шаг 1 из 5:</b> Выберите проект, к которому относится расход:",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("mexp_proj_"))
+async def cb_mexp_select_project(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer()
+  proj_short = callback.data.replace("mexp_proj_", "")
+  projects = await asyncio.to_thread(get_active_projects_sync)
+  full_project = next(
+      (p for p in projects if p.startswith(proj_short)), "Склад / Общее"
+  )
+
+  await state.update_data(project=full_project)
+
+  categories = [
+      "Субаренда оборудования",
+      "Гонорары наемным техникам",
+      "Такси / Логистика / ГСМ",
+      "Расходники (тейп, батарейки)",
+      "Склад / Ремонт оборудования",
+      "Прочее",
+  ]
+  kb = [
+      [InlineKeyboardButton(text=c, callback_data=f"mexp_cat_{c[:25]}")]
+      for c in categories
+  ]
+  kb.append(
+      [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_hub")]
+  )
+
+  await callback.message.edit_text(
+      f"🎯 Проект: <b>{full_project}</b>\n\n"
+      "<b>Шаг 2 из 5:</b> Выберите категорию расхода:",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("mexp_cat_"))
+async def cb_mexp_select_category(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer()
+  cat_short = callback.data.replace("mexp_cat_", "")
+  all_cats = [
+      "Субаренда оборудования",
+      "Гонорары наемным техникам",
+      "Такси / Логистика / ГСМ",
+      "Расходники (тейп, батарейки)",
+      "Склад / Ремонт оборудования",
+      "Прочее",
+  ]
+  full_cat = next((c for c in all_cats if c.startswith(cat_short)), "Прочее")
+
+  await state.update_data(category=full_cat)
+  await state.set_state(ManualExpenseState.waiting_for_amount)
+
+  await callback.message.edit_text(
+      f"📂 Категория: <b>{full_cat}</b>\n\n"
+      "<b>Шаг 3 из 5:</b> Введите сумму расхода в тенге (только число):\n"
+      "<i>Например: 85000</i>",
+      parse_mode="HTML",
+  )
+
+
+@dp.message(ManualExpenseState.waiting_for_amount, F.text)
+async def process_mexp_amount(message: types.Message, state: FSMContext):
+  try:
+    amount = float(message.text.replace(" ", "").replace(",", ".").strip())
+  except ValueError:
+    await message.answer("⚠️ Введите корректную сумму числом:")
+    return
+
+  await state.update_data(amount=amount)
+
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="🏢 Оплачено с кассы / счета ИП",
+                  callback_data="mexp_payer_kassa",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="👤 Оплатил лично (к возмещению)",
+                  callback_data="mexp_payer_admin",
+              )
+          ],
+          [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_hub")],
+      ]
+  )
+
+  await message.answer(
+      f"💵 Сумма: <b>{amount:,.0f} ₸</b>\n\n"
+      "<b>Шаг 4 из 5:</b> Кто и как оплатил этот расход?",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("mexp_payer_"))
+async def cb_mexp_select_payer(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer()
+  payer_type = callback.data.replace("mexp_payer_", "")
+  await state.update_data(payer_type=payer_type)
+  await state.set_state(ManualExpenseState.waiting_for_comment)
+
+  await callback.message.edit_text(
+      "📝 <b>Шаг 5 из 5:</b> Введите краткий комментарий к расходу:\n"
+      "<i>Например: Субаренда радиосистем Shure у Даурена на 2 дня</i>",
+      parse_mode="HTML",
+  )
+
+
+@dp.message(ManualExpenseState.waiting_for_comment, F.text)
+async def process_mexp_comment(message: types.Message, state: FSMContext):
+  comment = message.text.strip()
+  data = await state.get_data()
+  await state.clear()
+
+  status_msg = await message.answer("⏳ Записываю расход в таблицу...")
+
+  project = data.get("project", "Склад / Общее")
+  category = data.get("category", "Прочее")
+  amount = data.get("amount", 0.0)
+  payer_type = data.get("payer_type", "kassa")
+
+  if payer_type == "kassa":
+    payer_name = "Касса / ИП"
+    payout_status = "Не требуется"
+  else:
+    payer_name = await get_or_register_employee(message.from_user)
+    payout_status = "К возмещению"
+
+  def write_manual_expense():
+    ws = spreadsheet.worksheet("Операции")
+    tx_id = f"TX-{random.randint(10000, 99999)}"
+    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+    ws.append_row(
+        [
+            tx_id,
+            now_str,
+            "Расход",
+            project,
+            category,
+            amount,
+            payer_name,
+            payout_status,
+            "Вручную (без чека)",
+            comment,
+        ],
+        value_input_option="USER_ENTERED",
+    )
+
+  try:
+    await asyncio.to_thread(write_manual_expense)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="⬅️ В панель управления", callback_data="admin_hub"
+            )
+        ]]
+    )
+    await status_msg.edit_text(
+        f"✅ <b>Расход успешно внесен!</b>\n\n"
+        f"🎯 Проект: <b>{project}</b>\n"
+        f"📂 Категория: {category}\n"
+        f"💵 Сумма: <b>{amount:,.0f} ₸</b>\n"
+        f"💳 Оплата: {payer_name} ({payout_status})\n"
+        f"📝 Детали: <i>{comment}</i>",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+  except Exception as e:
+    await status_msg.edit_text(f"⚠️ Ошибка записи в таблицу: {e}")
+
+
+# --- ГОЛОСОВОЙ ВВОД МЕРОПРИЯТИЙ (3.6) ---
 
 
 @dp.callback_query(F.data == "admin_voice_project")
