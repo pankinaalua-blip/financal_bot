@@ -39,26 +39,14 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 ai_client = genai.Client(api_key=GEMINI_KEY)
 
-# Модели ИИ
-AUDIO_MODELS_CASCADE = [
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-pro",
-    "gemini-1.5-flash",
-]
-
-IMAGE_MODELS_CASCADE = [
-    "gemini-3.6-flash",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-    "gemini-1.5-flash",
-]
+# Строго модель 3.6
+AUDIO_MODEL = "gemini-3.6-flash"
+IMAGE_MODEL = "gemini-3.6-flash"
 
 # 3. Подключение к Google Таблицам
 SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive",
+    "[https://www.googleapis.com/auth/spreadsheets](https://www.googleapis.com/auth/spreadsheets)",
+    "[https://www.googleapis.com/auth/drive](https://www.googleapis.com/auth/drive)",
 ]
 creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
@@ -86,14 +74,11 @@ NAV_BUTTONS = [
 ]
 
 
-# --- АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ ФОРМУЛ И ИСПРАВЛЕНИЕ #ERROR! ---
+# --- ИСПРАВЛЕНИЕ ФОРМУЛ (#ERROR!) ---
 
 
 def repair_spreadsheet_sync():
   try:
-    print("🛠 Запуск автопочинки формул в Google Таблице...")
-
-    # 1. Чиним лист "Проекты" (7 колонок: Проект, Локация, Статус, Доход, Расходы, Прибыль, Маржа)
     ws_proj = spreadsheet.worksheet("Проекты")
     proj_rows = ws_proj.get_all_values()
 
@@ -110,7 +95,6 @@ def repair_spreadsheet_sync():
       ws_proj.update_cell(r_idx, 6, formula_prof)
       ws_proj.update_cell(r_idx, 7, formula_marg)
 
-    # 2. Чиним лист "Выплаты команде" (D: К выплате сейчас, E: Выплачено за все время)
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     pay_rows = ws_pay.get_all_values()
 
@@ -125,7 +109,7 @@ def repair_spreadsheet_sync():
       ws_pay.update_cell(r_idx, 4, formula_debt)
       ws_pay.update_cell(r_idx, 5, formula_paid)
 
-    print("✅ Все формулы в таблице успешно исправлены!")
+    print("✅ Формулы синхронизированы!")
     return True
   except Exception as e:
     print(f"Ошибка при починке таблицы: {e}")
@@ -486,12 +470,11 @@ async def cmd_fix_tables(message: types.Message):
   ok = await asyncio.to_thread(repair_spreadsheet_sync)
   if ok:
     await wait_m.edit_text(
-        "✅ <b>Таблица полностью исправлена!</b>\nВсе ошибки #ERROR! удалены, а"
-        " формулы расходов и маржи пересчитаны.",
+        "✅ <b>Таблица полностью исправлена!</b>\nВсе ошибки #ERROR! удалены.",
         parse_mode="HTML",
     )
   else:
-    await wait_m.edit_text("⚠️ Произошла ошибка при обновлении таблицы.")
+    await wait_m.edit_text("⚠️ Ошибка при обновлении таблицы.")
 
 
 @dp.message(F.text == "📸 Как отправить чек")
@@ -746,7 +729,7 @@ async def cb_end_shift(callback: types.CallbackQuery):
   await callback.message.edit_text(msg, parse_mode="HTML")
 
 
-# --- ПАНЕЛЬ ADMIN И ГОЛОСОВОЙ ВВОД (7 КОЛОНОК) ---
+# --- ПАНЕЛЬ ADMIN И ГОЛОСОВОЙ ВВОД (GEMINI 3.6) ---
 
 
 @dp.message(F.text == "💼 Панель выплат (Admin)")
@@ -804,7 +787,7 @@ async def cb_admin_repair_tables(callback: types.CallbackQuery):
   ok = await asyncio.to_thread(repair_spreadsheet_sync)
   if ok:
     await callback.message.answer(
-        "✅ <b>Таблица успешно исправлена!</b>\nВсе формулы #ERROR! заменены на"
+        "✅ <b>Таблица успешно исправлена!</b>\nВсе ошибки #ERROR! заменены на"
         " рабочие расчеты."
     )
   else:
@@ -890,69 +873,95 @@ async def render_project_card(target, data: dict):
     await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
-@dp.message(VoiceProjectState.waiting_for_voice, F.voice)
-async def process_voice_project(message: types.Message, state: FSMContext):
+# Функция распознавания аудио через gemini-3.6-flash
+async def handle_voice_processing(
+    message: types.Message, state: FSMContext, voice_obj
+):
   status_msg = await message.answer("🎧 Вслушиваюсь в голосовое (3.6)...")
 
-  voice = message.voice
   file_io = io.BytesIO()
-  await bot.download(voice, destination=file_io)
+  await bot.download(voice_obj, destination=file_io)
   audio_bytes = file_io.getvalue()
 
   prompt = """
     Ты финансовый ассистент компании по аренде сценического оборудования.
     Послушай аудиозапись администратора о новом мероприятии/проекте.
-    Сделай транскрипцию и верни СТРОГО JSON:
-    {
-      "transcript": "дословный текст голосового",
-      "event_date": "дата в формате ДД.ММ",
-      "project_name": "название события без даты (например: Концерт Баста, Свадьба Азамата)",
-      "location": "площадка (например: Отель Sheraton, Дворец Спорта, Rixos)",
-      "price": сумма сметы числом (например: 1500000),
-      "prepay_percent": 0, 50 или 100
-    }
+    
+    ИНСТРУКЦИИ:
+    1. "transcript": дословный текст, который произнес человек.
+    2. "event_date": дата в формате ДД.ММ (если не названа, поставь текущую).
+    3. "project_name": название проекта, артиста или заказчика (например: Свадьба Азамата, Баста).
+    4. "location": площадка (если не названа явно, поставь "Не указана").
+    5. "price": общая сумма сметы числом (например "полтора миллиона" -> 1500000, "пятьсот тысяч" -> 500000, если не названа -> 0).
+    6. "prepay_percent": 0, 50 или 100 (если не упомянули -> 0).
+    
+    Верни ТОЛЬКО чистый JSON объекта.
     """
 
-  response = None
-  for model_name in AUDIO_MODELS_CASCADE:
-    try:
-      resp = ai_client.models.generate_content(
-          model=model_name,
-          contents=[
-              genai_types.Part.from_bytes(
-                  data=audio_bytes, mime_type="audio/ogg"
-              ),
-              prompt,
-          ],
-          config=genai_types.GenerateContentConfig(
-              response_mime_type="application/json",
-              temperature=0.1,
-          ),
-      )
-      if resp and resp.text:
-        response = resp
-        break
-    except Exception as e:
-      print(f"Модель {model_name} пропущена ({e})...")
-      continue
-
-  if not response or not response.text:
-    await status_msg.edit_text("⚠️ Не удалось разобрать аудио. Попробуйте еще.")
-    return
-
   try:
-    data = json.loads(response.text.strip())
+    resp = ai_client.models.generate_content(
+        model=AUDIO_MODEL,
+        contents=[
+            genai_types.Part.from_bytes(
+                data=audio_bytes, mime_type="audio/ogg"
+            ),
+            prompt,
+        ],
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+
+    if not resp or not resp.text:
+      await status_msg.edit_text(
+          "⚠️ Не удалось разобрать аудио. Попробуйте наговорить еще раз."
+      )
+      return
+
+    # Надежная очистка JSON от Markdown
+    raw = resp.text.strip()
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start != -1 and end != 0:
+      raw = raw[start:end]
+
+    data = json.loads(raw)
+
+    await state.set_state(VoiceProjectState.waiting_for_voice)
     await state.update_data(
         transcript=data.get("transcript", ""),
         event_date=data.get("event_date", datetime.now().strftime("%d.%m")),
         project_name=data.get("project_name", "Мероприятие"),
-        location=data.get("location", "Площадка"),
+        location=data.get("location", "Не указана"),
         price=float(data.get("price", 0)),
         prepay_percent=int(data.get("prepay_percent", 0)),
     )
     await render_project_card(status_msg, await state.get_data())
+
   except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка: {e}")
+    print(f"Ошибка аудио 3.6: {e}")
+    await status_msg.edit_text(
+        f"⚠️ Ошибка обработки: {e}. Попробуйте наговорить еще раз."
+    )
+
+
+# Обработка голосового по кнопке
+@dp.message(VoiceProjectState.waiting_for_voice, F.voice | F.audio)
+async def process_voice_project_state(
+    message: types.Message, state: FSMContext
+):
+  voice_obj = message.voice or message.audio
+  await handle_voice_processing(message, state, voice_obj)
+
+
+# Прием голосового от администратора НАПРЯМУЮ в чат (без нажатия кнопки)
+@dp.message(F.from_user.id.in_(ADMIN_IDS), F.voice | F.audio)
+async def process_voice_project_direct(
+    message: types.Message, state: FSMContext
+):
+  voice_obj = message.voice or message.audio
+  await handle_voice_processing(message, state, voice_obj)
 
 
 @dp.callback_query(F.data == "edit_voice_fields_menu")
@@ -1068,7 +1077,6 @@ def add_project_to_sheets_sync(data: dict):
   prepay_pct = int(data.get("prepay_percent", 0))
   paid_amount = total_price * (prepay_pct / 100.0)
 
-  # Формулы строго под 7 колонок: D: Доход, E: Расходы, F: Прибыль, G: Маржа
   formula_expenses = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
   formula_profit = f"=D{next_row}-E{next_row}"
   formula_margin = f"=IF(D{next_row}>0; F{next_row}/D{next_row}; 0)"
@@ -1295,7 +1303,7 @@ async def handle_user_text_input(message: types.Message):
     )
 
 
-# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ---
+# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) НА 3.6 ---
 
 
 @dp.message(F.photo)
@@ -1325,37 +1333,34 @@ async def handle_photo(message: types.Message):
     }
     """
 
-  response = None
-  for model_name in IMAGE_MODELS_CASCADE:
-    try:
-      resp = ai_client.models.generate_content(
-          model=model_name,
-          contents=[
-              genai_types.Part.from_bytes(
-                  data=image_bytes, mime_type="image/jpeg"
-              ),
-              prompt,
-          ],
-          config=genai_types.GenerateContentConfig(
-              response_mime_type="application/json",
-              temperature=0.1,
-          ),
-      )
-      if resp and resp.text:
-        response = resp
-        break
-    except Exception as e:
-      print(f"Модель {model_name} временно недоступна ({e})...")
-      continue
-
-  if not response or not response.text:
-    await status_msg.edit_text(
-        "⚠️ Серверы ИИ перегружены. Отправьте чек еще раз."
-    )
-    return
-
   try:
-    data = json.loads(response.text.strip())
+    resp = ai_client.models.generate_content(
+        model=IMAGE_MODEL,
+        contents=[
+            genai_types.Part.from_bytes(
+                data=image_bytes, mime_type="image/jpeg"
+            ),
+            prompt,
+        ],
+        config=genai_types.GenerateContentConfig(
+            response_mime_type="application/json",
+            temperature=0.1,
+        ),
+    )
+
+    if not resp or not resp.text:
+      await status_msg.edit_text(
+          "⚠️ Не удалось прочитать чек. Отправьте еще раз."
+      )
+      return
+
+    raw = resp.text.strip()
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    if start != -1 and end != 0:
+      raw = raw[start:end]
+
+    data = json.loads(raw)
     amount = data.get("amount", 0)
     merchant = data.get("merchant", "Неизвестно")
 
@@ -1481,7 +1486,7 @@ async def process_project_choice(callback: types.CallbackQuery):
     await status_update.edit_text(f"⚠️ Ошибка записи: {e}")
 
 
-# --- ВЕБ-СЕРВЕР И ТОЧКА ВХОДА С АВТОПОЧИНКОЙ ПРИ СТАРТЕ ---
+# --- ВЕБ-СЕРВЕР И ТОЧКА ВХОДА ---
 
 
 async def handle_ping(request):
@@ -1497,8 +1502,7 @@ async def main():
   site = web.TCPSite(runner, "0.0.0.0", port)
   await site.start()
 
-  # Автоматическая починка формул при каждом запуске/перезапуске сервиса
-  print("Сервер запущен. Проверяем и восстанавливаем формулы в таблице...")
+  print("Синхронизируем формулы с таблицей...")
   await asyncio.to_thread(repair_spreadsheet_sync)
 
   print(f"Сервер слушает порт {port}, запускаем бота...")
