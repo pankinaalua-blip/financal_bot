@@ -50,14 +50,14 @@ waiting_for_requisites = {}
 saved_receipt_file_ids = set()
 
 
-# Функция защиты от ошибки 503 (Всегда 3.6 в приоритете + авто-повтор)
+# Функция защиты от ошибки 503 (3.6 в приоритете + авто-повтор)
 async def call_gemini_safe(contents, json_mode: bool = True):
   models_cascade = [
-      "gemini-3.6-flash",  # 1-я попытка на 3.6
-      "gemini-3.6-flash",  # Повтор на 3.6 при кратковременном скачке
-      "gemini-2.5-flash",  # Мгновенная подстраховка
-      "gemini-2.0-flash",  # Резерв
-      "gemini-1.5-flash",  # Запасной шлюз
+      "gemini-3.6-flash",
+      "gemini-3.6-flash",
+      "gemini-2.5-flash",
+      "gemini-2.0-flash",
+      "gemini-1.5-flash",
   ]
 
   config = (
@@ -79,7 +79,6 @@ async def call_gemini_safe(contents, json_mode: bool = True):
         return resp.text
     except Exception as e:
       print(f"Попытка на {model_name} временно не прошла ({e})...")
-      # Если это первый сбой на 3.6, ждем секунду и повторяем
       if idx == 0:
         await asyncio.sleep(1.0)
       else:
@@ -258,7 +257,7 @@ def save_employee_requisites_sync(employee_name: str, requisites_text: str):
     print(f"Ошибка сохранения реквизитов: {e}")
 
 
-# --- УМНАЯ ФИЛЬТРАЦИЯ ПРОЕКТОВ ---
+# --- УМНАЯ ФИЛЬТРАЦИЯ И СМЕНА СТАТУСА ПРОЕКТОВ ---
 
 
 def get_filtered_projects_sync(show_all: bool = False) -> list[str]:
@@ -302,6 +301,36 @@ def get_filtered_projects_sync(show_all: bool = False) -> list[str]:
   except Exception as e:
     print(f"Ошибка получения проектов: {e}")
     return ["Склад / Общее"]
+
+
+def set_project_status_sync(
+    proj_prefix: str, new_status: str = "Завершен"
+) -> str | None:
+  try:
+    ws = spreadsheet.worksheet("Проекты")
+    all_values = ws.get_all_values()
+    if not all_values:
+      return None
+
+    status_col_idx = 3
+    proj_col_idx = 1
+    headers = [str(h).strip().lower() for h in all_values[0]]
+    for idx, h in enumerate(headers, start=1):
+      if "статус" in h:
+        status_col_idx = idx
+      elif "проект" in h:
+        proj_col_idx = idx
+
+    for r_idx, row in enumerate(all_values[1:], start=2):
+      if len(row) >= proj_col_idx:
+        proj_name = row[proj_col_idx - 1].strip()
+        if proj_name.startswith(proj_prefix) or proj_prefix in proj_name:
+          ws.update_cell(r_idx, status_col_idx, new_status)
+          return proj_name
+    return None
+  except Exception as e:
+    print(f"Ошибка изменения статуса проекта: {e}")
+    return None
 
 
 def log_expense_sync(
@@ -527,7 +556,9 @@ async def cmd_fix_tables(message: types.Message):
   wait_m = await message.answer("⏳ Исправляю формулы в Google Таблице...")
   ok = await asyncio.to_thread(repair_spreadsheet_sync)
   if ok:
-    await wait_m.edit_text("✅ Формулы в таблице восстановлены!", parse_mode="HTML")
+    await wait_m.edit_text(
+        "✅ Формулы в таблице восстановлены!", parse_mode="HTML"
+    )
   else:
     await wait_m.edit_text("⚠️ Ошибка при обновлении таблицы.")
 
@@ -536,7 +567,8 @@ async def cmd_fix_tables(message: types.Message):
 async def msg_how_to(message: types.Message):
   await message.answer(
       "📷 <b>Как отправить чек:</b>\n\n"
-      "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс Go).\n"
+      "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс"
+      " Go).\n"
       "2. Gemini автоматически определит сумму и категорию расхода.\n"
       "3. Выберите проект кнопкой.",
       parse_mode="HTML",
@@ -557,9 +589,14 @@ async def msg_my_receipts(message: types.Message):
     )
     return
 
-  text = f"👤 <b>Чеки к возмещению ({name})</b>\n\n💰 <b>Итого:</b> {total:,.0f} ₸\n\n"
+  text = (
+      f"👤 <b>Чеки к возмещению ({name})</b>\n\n💰 <b>Итого:</b> {total:,.0f}"
+      " ₸\n\n"
+  )
   for it in items[:10]:
-    text += f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
+    text += (
+        f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
+    )
 
   await status_wait.edit_text(text, parse_mode="HTML")
 
@@ -661,7 +698,11 @@ async def cmd_shift_menu(message: types.Message):
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔴 Завершить смену", callback_data="end_shift")],
+            [
+                InlineKeyboardButton(
+                    text="🔴 Завершить смену", callback_data="end_shift"
+                )
+            ],
             [
                 InlineKeyboardButton(
                     text="🍔 Взять обед сейчас (2 500 ₸)",
@@ -685,7 +726,9 @@ async def cb_startshift_showall(callback: types.CallbackQuery):
   await callback.message.edit_reply_markup(reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("startshift_") & (F.data != "startshift_showall"))
+@dp.callback_query(
+    F.data.startswith("startshift_") & (F.data != "startshift_showall")
+)
 async def cb_start_shift(callback: types.CallbackQuery):
   await callback.answer()
   user_id = callback.from_user.id
@@ -701,7 +744,8 @@ async def cb_start_shift(callback: types.CallbackQuery):
       "claimed_meals": 0,
   }
   await callback.message.edit_text(
-      f"🟢 <b>Смена начата!</b>\n🎯 Проект: <b>{full_project}</b>\n🕒 Время: {datetime.now().strftime('%H:%M')}",
+      f"🟢 <b>Смена начата!</b>\n🎯 Проект: <b>{full_project}</b>\n🕒 Время:"
+      f" {datetime.now().strftime('%H:%M')}",
       parse_mode="HTML",
   )
 
@@ -734,7 +778,8 @@ async def cb_end_shift(callback: types.CallbackQuery):
     )
 
   await callback.message.edit_text(
-      f"🔴 <b>Смена завершена!</b>\n🎯 {shift['project']}\n⏱ {int(hours)} ч. {int((duration.total_seconds() % 3600) // 60)} мин.",
+      f"🔴 <b>Смена завершена!</b>\n🎯 {shift['project']}\n⏱ {int(hours)} ч."
+      f" {int((duration.total_seconds() % 3600) // 60)} мин.",
       parse_mode="HTML",
   )
 
@@ -774,9 +819,13 @@ async def render_admin_menu(event_target):
       ],
       [
           InlineKeyboardButton(
-              text=f"💸 Выплаты команде ({len(debts)})",
+              text="🏁 Завершить проект",
+              callback_data="admin_close_project",
+          ),
+          InlineKeyboardButton(
+              text=f"💸 Выплаты ({len(debts)})",
               callback_data="admin_payouts_list",
-          )
+          ),
       ],
       [
           InlineKeyboardButton(
@@ -791,7 +840,9 @@ async def render_admin_menu(event_target):
   if isinstance(event_target, types.Message):
     await event_target.answer(text, reply_markup=kb, parse_mode="HTML")
   else:
-    await event_target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await event_target.message.edit_text(
+        text, reply_markup=kb, parse_mode="HTML"
+    )
 
 
 @dp.callback_query(F.data == "admin_repair_tables")
@@ -814,11 +865,93 @@ async def cb_admin_hub(callback: types.CallbackQuery, state: FSMContext):
   await render_admin_menu(callback)
 
 
+# --- ЗАВЕРШЕНИЕ ПРОЕКТА В АДМИНКЕ ---
+
+
+@dp.callback_query(F.data == "admin_close_project")
+async def cb_admin_close_project_list(callback: types.CallbackQuery):
+  await callback.answer()
+  if callback.from_user.id not in ADMIN_IDS:
+    return
+
+  projects = await asyncio.to_thread(get_filtered_projects_sync, True)
+  active_projs = [p for p in projects if p != "Склад / Общее"]
+
+  if not active_projs:
+    await callback.message.edit_text(
+        "🏁 <b>Все проекты уже завершены!</b>\n\nНет активных мероприятий для"
+        " закрытия.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")
+            ]]
+        ),
+        parse_mode="HTML",
+    )
+    return
+
+  kb = [
+      [
+          InlineKeyboardButton(
+              text=f"🏁 {p}", callback_data=f"closeproj_{p[:25]}"
+          )
+      ]
+      for p in active_projs
+  ]
+  kb.append(
+      [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_hub")]
+  )
+
+  await callback.message.edit_text(
+      "🏁 <b>Завершение проекта</b>\n\n"
+      "Выберите проект, который нужно перевести в статус <b>«Завершен»</b>:\n"
+      "<i>(Он перестанет всплывать в меню выбора у всей команды)</i>",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("closeproj_"))
+async def cb_confirm_close_project(callback: types.CallbackQuery):
+  await callback.answer("Завершаю проект...")
+  if callback.from_user.id not in ADMIN_IDS:
+    return
+
+  proj_prefix = callback.data.replace("closeproj_", "")
+  closed_name = await asyncio.to_thread(
+      set_project_status_sync, proj_prefix, "Завершен"
+  )
+
+  if closed_name:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="⬅️ В панель управления", callback_data="admin_hub"
+            )
+        ]]
+    )
+    await callback.message.edit_text(
+        "✅ <b>Проект успешно завершен!</b>\n\n"
+        f"🎯 <b>{closed_name}</b>\n"
+        "📊 Статус в таблице изменен на <b>«Завершен»</b>.\n"
+        "Проект скрыт из списков выбора команды.",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+  else:
+    await callback.answer(
+        "⚠️ Не удалось найти проект в таблице.", show_alert=True
+    )
+    await render_admin_menu(callback)
+
+
 # --- СОКРАЩЕННЫЙ РАСХОД: В 2 ШАГА ---
 
 
 @dp.callback_query(F.data == "admin_fast_expense")
-async def cb_fast_expense_start(callback: types.CallbackQuery, state: FSMContext):
+async def cb_fast_expense_start(
+    callback: types.CallbackQuery, state: FSMContext
+):
   await callback.answer()
   if callback.from_user.id not in ADMIN_IDS:
     return
@@ -840,8 +973,12 @@ async def cb_fastexp_showall(callback: types.CallbackQuery):
   await callback.message.edit_reply_markup(reply_markup=kb)
 
 
-@dp.callback_query(F.data.startswith("fastexp_") & (F.data != "fastexp_showall"))
-async def cb_fast_expense_choose_proj(callback: types.CallbackQuery, state: FSMContext):
+@dp.callback_query(
+    F.data.startswith("fastexp_") & (F.data != "fastexp_showall")
+)
+async def cb_fast_expense_choose_proj(
+    callback: types.CallbackQuery, state: FSMContext
+):
   await callback.answer()
   proj_short = callback.data.replace("fastexp_", "")
   projects = await asyncio.to_thread(get_filtered_projects_sync, True)
@@ -857,13 +994,16 @@ async def cb_fast_expense_choose_proj(callback: types.CallbackQuery, state: FSMC
       "<b>Шаг 2 из 2:</b> Напишите в чат сумму и суть одной строчкой.\n\n"
       "<i>Примеры:\n"
       "• <code>75000 субаренда микрофонов</code> (спишет с кассы/ИП)\n"
-      "• <code>25000 газель доставка лично</code> (поставит к возмещению вам)</i>",
+      "• <code>25000 газель доставка лично</code> (поставит к возмещению"
+      " вам)</i>",
       parse_mode="HTML",
   )
 
 
 @dp.message(QuickExpenseState.waiting_for_details, F.text)
-async def process_fast_expense_details(message: types.Message, state: FSMContext):
+async def process_fast_expense_details(
+    message: types.Message, state: FSMContext
+):
   text_input = message.text.strip()
   data = await state.get_data()
   project = data.get("project", "Склад / Общее")
@@ -884,7 +1024,9 @@ async def process_fast_expense_details(message: types.Message, state: FSMContext
   try:
     resp_text = await call_gemini_safe(prompt, json_mode=True)
     if not resp_text:
-      await status_msg.edit_text("⚠️ Серверы временно перегружены. Попробуйте еще раз через секунду.")
+      await status_msg.edit_text(
+          "⚠️ Серверы временно перегружены. Попробуйте еще раз через секунду."
+      )
       return
 
     raw = resp_text.strip()
@@ -918,7 +1060,9 @@ async def process_fast_expense_details(message: types.Message, state: FSMContext
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ В панель управления", callback_data="admin_hub")
+            InlineKeyboardButton(
+                text="⬅️ В панель управления", callback_data="admin_hub"
+            )
         ]]
     )
     await status_msg.edit_text(
@@ -939,7 +1083,9 @@ async def process_fast_expense_details(message: types.Message, state: FSMContext
 
 
 @dp.callback_query(F.data == "admin_create_project")
-async def cb_start_project_creation(callback: types.CallbackQuery, state: FSMContext):
+async def cb_start_project_creation(
+    callback: types.CallbackQuery, state: FSMContext
+):
   await callback.answer()
   if callback.from_user.id not in ADMIN_IDS:
     return
@@ -948,7 +1094,8 @@ async def cb_start_project_creation(callback: types.CallbackQuery, state: FSMCon
   await callback.message.edit_text(
       "➕ <b>Создание нового мероприятия</b>\n\n"
       "🎙 <b>Надиктуйте голосовое</b> ИЛИ ✍️ <b>напишите текстом:</b>\n\n"
-      "<i>Пример текста:\n«25.09 Концерт Баста, Дворец Спорта, смета 1.5 млн, предоплата 50%»</i>\n\n"
+      "<i>Пример текста:\n«25.09 Концерт Баста, Дворец Спорта, смета 1.5 млн,"
+      " предоплата 50%»</i>\n\n"
       "Жду аудио или текст...",
       parse_mode="HTML",
   )
@@ -974,10 +1121,19 @@ async def render_project_card(target, data: dict):
 
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="✅ Все верно, создать!", callback_data="confirm_voice_proj")],
           [
-              InlineKeyboardButton(text="🔄 Заново", callback_data="admin_create_project"),
-              InlineKeyboardButton(text="✏️ Исправить", callback_data="edit_voice_fields_menu"),
+              InlineKeyboardButton(
+                  text="✅ Все верно, создать!",
+                  callback_data="confirm_voice_proj",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="🔄 Заново", callback_data="admin_create_project"
+              ),
+              InlineKeyboardButton(
+                  text="✏️ Исправить", callback_data="edit_voice_fields_menu"
+              ),
           ],
           [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_hub")],
       ]
@@ -989,7 +1145,9 @@ async def render_project_card(target, data: dict):
     await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
-async def parse_project_with_gemini(message: types.Message, state: FSMContext, contents):
+async def parse_project_with_gemini(
+    message: types.Message, state: FSMContext, contents
+):
   status_msg = await message.answer("🤖 Распознаю проект (Gemini)...")
   prompt = """
     Ты финансовый ассистент компании аренды сценического оборудования.
@@ -1004,13 +1162,18 @@ async def parse_project_with_gemini(message: types.Message, state: FSMContext, c
     """
   try:
     if isinstance(contents, bytes):
-      parts = [genai_types.Part.from_bytes(data=contents, mime_type="audio/ogg"), prompt]
+      parts = [
+          genai_types.Part.from_bytes(data=contents, mime_type="audio/ogg"),
+          prompt,
+      ]
     else:
       parts = [contents, prompt]
 
     resp_text = await call_gemini_safe(parts, json_mode=True)
     if not resp_text:
-      await status_msg.edit_text("⚠️ Серверы временно перегружены. Попробуйте еще раз.")
+      await status_msg.edit_text(
+          "⚠️ Серверы временно перегружены. Попробуйте еще раз."
+      )
       return
 
     raw = resp_text.strip()
@@ -1031,7 +1194,6 @@ async def parse_project_with_gemini(message: types.Message, state: FSMContext, c
     await status_msg.edit_text(f"⚠️ Ошибка разбора: {e}")
 
 
-# Прием голоса для проекта
 @dp.message(ProjectCreationState.waiting_for_input, F.voice | F.audio)
 @dp.message(F.from_user.id.in_(ADMIN_IDS), F.voice | F.audio)
 async def process_project_voice(message: types.Message, state: FSMContext):
@@ -1041,7 +1203,6 @@ async def process_project_voice(message: types.Message, state: FSMContext):
   await parse_project_with_gemini(message, state, file_io.getvalue())
 
 
-# Прием текста для проекта
 @dp.message(ProjectCreationState.waiting_for_input, F.text)
 async def process_project_text(message: types.Message, state: FSMContext):
   await parse_project_with_gemini(message, state, message.text.strip())
@@ -1053,22 +1214,44 @@ async def cb_edit_fields_menu(callback: types.CallbackQuery):
   kb = InlineKeyboardMarkup(
       inline_keyboard=[
           [
-              InlineKeyboardButton(text="📅 Дату", callback_data="field_event_date"),
-              InlineKeyboardButton(text="🎯 Название", callback_data="field_project_name"),
+              InlineKeyboardButton(
+                  text="📅 Дату", callback_data="field_event_date"
+              ),
+              InlineKeyboardButton(
+                  text="🎯 Название", callback_data="field_project_name"
+              ),
           ],
           [
-              InlineKeyboardButton(text="📍 Локацию", callback_data="field_location"),
-              InlineKeyboardButton(text="💵 Смету", callback_data="field_price"),
+              InlineKeyboardButton(
+                  text="📍 Локацию", callback_data="field_location"
+              ),
+              InlineKeyboardButton(
+                  text="💵 Смету", callback_data="field_price"
+              ),
           ],
-          [InlineKeyboardButton(text="💰 Предоплату (%)", callback_data="field_prepay_percent")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_card")],
+          [
+              InlineKeyboardButton(
+                  text="💰 Предоплату (%)", callback_data="field_prepay_percent"
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="⬅️ Назад", callback_data="back_to_card"
+              )
+          ],
       ]
   )
-  await callback.message.edit_text("✏️ <b>Выберите поле для исправления:</b>", reply_markup=kb, parse_mode="HTML")
+  await callback.message.edit_text(
+      "✏️ <b>Выберите поле для исправления:</b>",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
 
 
 @dp.callback_query(F.data.startswith("field_"))
-async def cb_select_field_to_edit(callback: types.CallbackQuery, state: FSMContext):
+async def cb_select_field_to_edit(
+    callback: types.CallbackQuery, state: FSMContext
+):
   await callback.answer()
   field_name = callback.data.replace("field_", "")
   await state.update_data(editing_target=field_name)
@@ -1081,7 +1264,9 @@ async def cb_select_field_to_edit(callback: types.CallbackQuery, state: FSMConte
       "price": "Введите <b>смету числом</b> (1500000):",
       "prepay_percent": "Введите <b>процент предоплаты (0, 50 или 100)</b>:",
   }
-  await callback.message.edit_text(prompts.get(field_name, "Введите значение:"), parse_mode="HTML")
+  await callback.message.edit_text(
+      prompts.get(field_name, "Введите значение:"), parse_mode="HTML"
+  )
 
 
 @dp.message(ProjectCreationState.editing_field, F.text)
@@ -1177,7 +1362,9 @@ def add_project_to_sheets_sync(data: dict):
 
 
 @dp.callback_query(F.data == "confirm_voice_proj")
-async def cb_confirm_voice_proj(callback: types.CallbackQuery, state: FSMContext):
+async def cb_confirm_voice_proj(
+    callback: types.CallbackQuery, state: FSMContext
+):
   await callback.answer()
   data = await state.get_data()
   if not data or "project_name" not in data:
@@ -1194,7 +1381,9 @@ async def cb_confirm_voice_proj(callback: types.CallbackQuery, state: FSMContext
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[
-            InlineKeyboardButton(text="⬅️ В панель управления", callback_data="admin_hub")
+            InlineKeyboardButton(
+                text="⬅️ В панель управления", callback_data="admin_hub"
+            )
         ]]
     )
 
@@ -1237,7 +1426,9 @@ async def cb_admin_payouts_list(callback: types.CallbackQuery):
           )
       ])
 
-  buttons.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")])
+  buttons.append(
+      [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")]
+  )
   kb = InlineKeyboardMarkup(inline_keyboard=buttons)
   await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
@@ -1265,7 +1456,11 @@ async def cb_pay_person_preview(callback: types.CallbackQuery):
                   callback_data=f"confirmpay_{person_prefix[:20]}",
               )
           ],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_payouts_list")],
+          [
+              InlineKeyboardButton(
+                  text="⬅️ Назад", callback_data="admin_payouts_list"
+              )
+          ],
       ]
   )
 
@@ -1319,7 +1514,10 @@ async def cb_confirm_payment(callback: types.CallbackQuery):
 # --- ПЕРЕХВАТ ТЕКСТА РЕКВИЗИТОВ ---
 
 
-@dp.message(StateFilter(None), F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS))
+@dp.message(
+    StateFilter(None),
+    F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS),
+)
 async def handle_user_text_input(message: types.Message):
   user_id = message.from_user.id
   if user_id in waiting_for_requisites:
@@ -1329,13 +1527,14 @@ async def handle_user_text_input(message: types.Message):
         save_employee_requisites_sync, employee, message.text.strip()
     )
     await message.answer(
-        f"✅ <b>Реквизиты сохранены!</b>\n\n👤 {employee}\n📋 <code>{message.text.strip()}</code>",
+        f"✅ <b>Реквизиты сохранены!</b>\n\n👤 {employee}\n📋"
+        f" <code>{message.text.strip()}</code>",
         reply_markup=get_main_keyboard(user_id),
         parse_mode="HTML",
     )
 
 
-# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) С ЗАЩИТОЙ ОТ 503 ---
+# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ---
 
 
 @dp.message(F.photo)
@@ -1373,7 +1572,8 @@ async def handle_photo(message: types.Message):
 
     if not resp_text:
       await status_msg.edit_text(
-          "⚠️ Серверы Google перегружены. Пожалуйста, отправьте чек еще раз через секунду."
+          "⚠️ Серверы Google перегружены. Пожалуйста, отправьте чек еще раз"
+          " через секунду."
       )
       return
 
@@ -1400,12 +1600,22 @@ async def handle_photo(message: types.Message):
     if duplicate:
       kb_dup = InlineKeyboardMarkup(
           inline_keyboard=[
-              [InlineKeyboardButton(text="➕ Да, это отдельный чек", callback_data="confirm_duplicate_ok")],
-              [InlineKeyboardButton(text="❌ Отмена (дубль)", callback_data="cancel_duplicate")],
+              [
+                  InlineKeyboardButton(
+                      text="➕ Да, это отдельный чек",
+                      callback_data="confirm_duplicate_ok",
+                  )
+              ],
+              [
+                  InlineKeyboardButton(
+                      text="❌ Отмена (дубль)", callback_data="cancel_duplicate"
+                  )
+              ],
           ]
       )
       await status_msg.edit_text(
-          f"⚠️ <b>Похожий чек уже был сегодня!</b>\n💵 {duplicate['amount']:,.0f} ₸ ({merchant})\nЭто отдельная покупка?",
+          f"⚠️ <b>Похожий чек уже был сегодня!</b>\n💵"
+          f" {duplicate['amount']:,.0f} ₸ ({merchant})\nЭто отдельная покупка?",
           reply_markup=kb_dup,
           parse_mode="HTML",
       )
@@ -1426,7 +1636,11 @@ async def cb_confirm_duplicate(callback: types.CallbackQuery):
     return
 
   await show_project_selection(
-      callback, receipt["amount"], receipt["merchant"], receipt, receipt["user_name"]
+      callback,
+      receipt["amount"],
+      receipt["merchant"],
+      receipt,
+      receipt["user_name"],
   )
 
 
