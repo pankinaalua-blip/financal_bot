@@ -64,8 +64,7 @@ creds = Credentials.from_service_account_file("credentials.json", scopes=SCOPES)
 gc = gspread.authorize(creds)
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
-# Память состояний и кэш
-employee_cache = {}  # Кэш сотрудников для устранения задержек
+employee_cache = {}
 pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
@@ -87,7 +86,53 @@ NAV_BUTTONS = [
 ]
 
 
-# --- СИНХРОНИЗАЦИЯ СОТРУДНИКОВ С КЭШЕМ ---
+# --- АВТОМАТИЧЕСКОЕ ВОССТАНОВЛЕНИЕ ФОРМУЛ И ИСПРАВЛЕНИЕ #ERROR! ---
+
+
+def repair_spreadsheet_sync():
+  try:
+    print("🛠 Запуск автопочинки формул в Google Таблице...")
+
+    # 1. Чиним лист "Проекты" (7 колонок: Проект, Локация, Статус, Доход, Расходы, Прибыль, Маржа)
+    ws_proj = spreadsheet.worksheet("Проекты")
+    proj_rows = ws_proj.get_all_values()
+
+    for r_idx in range(2, len(proj_rows) + 1):
+      proj_name = ws_proj.cell(r_idx, 1).value
+      if not proj_name:
+        continue
+
+      formula_exp = f'=SUMIFS(Операции!F:F; Операции!D:D; A{r_idx}; Операции!C:C; "Расход")'
+      formula_prof = f"=D{r_idx}-E{r_idx}"
+      formula_marg = f"=IF(D{r_idx}>0; F{r_idx}/D{r_idx}; 0)"
+
+      ws_proj.update_cell(r_idx, 5, formula_exp)
+      ws_proj.update_cell(r_idx, 6, formula_prof)
+      ws_proj.update_cell(r_idx, 7, formula_marg)
+
+    # 2. Чиним лист "Выплаты команде" (D: К выплате сейчас, E: Выплачено за все время)
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    pay_rows = ws_pay.get_all_values()
+
+    for r_idx in range(2, len(pay_rows) + 1):
+      emp_name = ws_pay.cell(r_idx, 1).value
+      if not emp_name:
+        continue
+
+      formula_debt = f'=SUMIFS(Операции!F:F; Операции!G:G; A{r_idx}; Операции!H:H; "К возмещению")'
+      formula_paid = f'=SUMIFS(Операции!F:F; Операции!G:G; A{r_idx}; Операции!H:H; "Выплачено")'
+
+      ws_pay.update_cell(r_idx, 4, formula_debt)
+      ws_pay.update_cell(r_idx, 5, formula_paid)
+
+    print("✅ Все формулы в таблице успешно исправлены!")
+    return True
+  except Exception as e:
+    print(f"Ошибка при починке таблицы: {e}")
+    return False
+
+
+# --- РАБОТА С СОТРУДНИКАМИ И РЕКВИЗИТАМИ ---
 
 
 def get_or_register_employee_sync(user: types.User) -> str:
@@ -245,18 +290,21 @@ def log_expense_sync(
   tx_id = f"TX-{random.randint(10000, 99999)}"
   now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
 
-  ws.append_row([
-      tx_id,
-      now_str,
-      "Расход",
-      project,
-      category,
-      amount,
-      employee,
-      "К возмещению",
-      check_type,
-      comment,
-  ])
+  ws.append_row(
+      [
+          tx_id,
+          now_str,
+          "Расход",
+          project,
+          category,
+          amount,
+          employee,
+          "К возмещению",
+          check_type,
+          comment,
+      ],
+      value_input_option="USER_ENTERED",
+  )
 
 
 def check_for_duplicate_receipt_sync(
@@ -402,7 +450,7 @@ def get_user_pending_receipts_sync(user: types.User):
   return employee_name, total, user_items
 
 
-# --- ОБРАБОТЧИКИ КОМАНД И КНОПОК ---
+# --- ОБРАБОТЧИКИ КОМАНД И МЕНЮ ---
 
 
 @dp.message(CommandStart())
@@ -428,6 +476,22 @@ async def cmd_start(message: types.Message):
       reply_markup=kb,
       parse_mode="HTML",
   )
+
+
+@dp.message(Command("fix"))
+async def cmd_fix_tables(message: types.Message):
+  if message.from_user.id not in ADMIN_IDS:
+    return
+  wait_m = await message.answer("⏳ Исправляю формулы в Google Таблице...")
+  ok = await asyncio.to_thread(repair_spreadsheet_sync)
+  if ok:
+    await wait_m.edit_text(
+        "✅ <b>Таблица полностью исправлена!</b>\nВсе ошибки #ERROR! удалены, а"
+        " формулы расходов и маржи пересчитаны.",
+        parse_mode="HTML",
+    )
+  else:
+    await wait_m.edit_text("⚠️ Произошла ошибка при обновлении таблицы.")
 
 
 @dp.message(F.text == "📸 Как отправить чек")
@@ -682,7 +746,7 @@ async def cb_end_shift(callback: types.CallbackQuery):
   await callback.message.edit_text(msg, parse_mode="HTML")
 
 
-# --- ПАНЕЛЬ ADMIN И ГОЛОС ---
+# --- ПАНЕЛЬ ADMIN И ГОЛОСОВОЙ ВВОД (7 КОЛОНОК) ---
 
 
 @dp.message(F.text == "💼 Панель выплат (Admin)")
@@ -716,6 +780,12 @@ async def render_admin_menu(event_target):
               callback_data="admin_payouts_list",
           )
       ],
+      [
+          InlineKeyboardButton(
+              text="🛠 Починить формулы в таблице",
+              callback_data="admin_repair_tables",
+          )
+      ],
       [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_hub")],
   ]
 
@@ -726,6 +796,20 @@ async def render_admin_menu(event_target):
     await event_target.message.edit_text(
         text, reply_markup=kb, parse_mode="HTML"
     )
+
+
+@dp.callback_query(F.data == "admin_repair_tables")
+async def cb_admin_repair_tables(callback: types.CallbackQuery):
+  await callback.answer("Исправляю формулы...")
+  ok = await asyncio.to_thread(repair_spreadsheet_sync)
+  if ok:
+    await callback.message.answer(
+        "✅ <b>Таблица успешно исправлена!</b>\nВсе формулы #ERROR! заменены на"
+        " рабочие расчеты."
+    )
+  else:
+    await callback.message.answer("⚠️ Не удалось исправить таблицу.")
+  await render_admin_menu(callback)
 
 
 @dp.callback_query(F.data == "admin_hub")
@@ -770,7 +854,7 @@ async def render_project_card(target, data: dict):
   text = (
       "📋 <b>Проверьте данные проекта:</b>\n\n"
       f"{transcript_block}"
-      f"📅 <b>Дата мероприятия:</b> {event_date}\n"
+      f"📅 <b>Дата:</b> {event_date}\n"
       f"🎯 <b>Название:</b> {proj_name}\n"
       f"📍 <b>Локация / Площадка:</b> {location}\n"
       f"💵 <b>Смета договора:</b> {price:,.0f} ₸\n"
@@ -808,7 +892,7 @@ async def render_project_card(target, data: dict):
 
 @dp.message(VoiceProjectState.waiting_for_voice, F.voice)
 async def process_voice_project(message: types.Message, state: FSMContext):
-  status_msg = await message.answer("🎧 Вслушиваюсь в голосовое...")
+  status_msg = await message.answer("🎧 Вслушиваюсь в голосовое (3.6)...")
 
   voice = message.voice
   file_io = io.BytesIO()
@@ -816,32 +900,15 @@ async def process_voice_project(message: types.Message, state: FSMContext):
   audio_bytes = file_io.getvalue()
 
   prompt = """
-    Ты — экспертный финансовый ассистент компании по аренде сценического оборудования.
-    Внимательно прослушай голосовое сообщение администратора о новом мероприятии/проекте.
-
-    ИНСТРУКЦИИ:
-    1. Сначала сделай точную текстовую транскрипцию всего, что услышал, в поле "transcript".
-    2. Переведи словесные числа в цифры:
-       - "полтора миллиона" / "полтора ляма" -> 1500000
-       - "пятьсот тысяч" / "полмиллиона" -> 500000
-       - "два миллиона триста тысяч" -> 2300000
-       - "пятьдесят тысяч" -> 50000
-    3. Выдели дату мероприятия:
-       - "двадцать пятое сентября" -> "25.09"
-       - "пятнадцатое октября" -> "15.10"
-       - "первое ноября" -> "01.11"
-    4. Предоплата:
-       - если сказали "аванс 50%", "предоплата половина" -> 50
-       - если сказали "полная оплата", "100%", "оплатили всё" -> 100
-       - если не упомянули или сказали "без предоплаты" -> 0
-
-    Верни СТРОГО JSON:
+    Ты финансовый ассистент компании по аренде сценического оборудования.
+    Послушай аудиозапись администратора о новом мероприятии/проекте.
+    Сделай транскрипцию и верни СТРОГО JSON:
     {
-      "transcript": "текст",
-      "event_date": "дата ДД.ММ",
-      "project_name": "название БЕЗ даты",
-      "location": "площадка",
-      "price": сумма числом,
+      "transcript": "дословный текст голосового",
+      "event_date": "дата в формате ДД.ММ",
+      "project_name": "название события без даты (например: Концерт Баста, Свадьба Азамата)",
+      "location": "площадка (например: Отель Sheraton, Дворец Спорта, Rixos)",
+      "price": сумма сметы числом (например: 1500000),
       "prepay_percent": 0, 50 или 100
     }
     """
@@ -1001,14 +1068,14 @@ def add_project_to_sheets_sync(data: dict):
   prepay_pct = int(data.get("prepay_percent", 0))
   paid_amount = total_price * (prepay_pct / 100.0)
 
+  # Формулы строго под 7 колонок: D: Доход, E: Расходы, F: Прибыль, G: Маржа
   formula_expenses = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
-  formula_profit = f"=E{next_row}-F{next_row}"
-  formula_margin = f"=IF(E{next_row}>0; G{next_row}/E{next_row}; 0)"
+  formula_profit = f"=D{next_row}-E{next_row}"
+  formula_margin = f"=IF(D{next_row}>0; F{next_row}/D{next_row}; 0)"
 
   ws_proj.append_row(
       [
           full_proj_name,
-          event_date,
           data.get("location", "Площадка"),
           "В работе",
           total_price,
@@ -1023,18 +1090,21 @@ def add_project_to_sheets_sync(data: dict):
     ws_ops = spreadsheet.worksheet("Операции")
     tx_id = f"TX-{random.randint(10000, 99999)}"
     now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    ws_ops.append_row([
-        tx_id,
-        now_str,
-        "Доход",
-        full_proj_name,
-        "Комплексный продакшн",
-        paid_amount,
-        "Клиент",
-        "Не требуется",
-        "-",
-        f"Предоплата ({prepay_pct}%)",
-    ])
+    ws_ops.append_row(
+        [
+            tx_id,
+            now_str,
+            "Доход",
+            full_proj_name,
+            "Комплексный продакшн",
+            paid_amount,
+            "Клиент",
+            "Не требуется",
+            "-",
+            f"Предоплата ({prepay_pct}%)",
+        ],
+        value_input_option="USER_ENTERED",
+    )
 
   return full_proj_name, total_price, paid_amount
 
@@ -1068,7 +1138,6 @@ async def cb_confirm_voice_proj(
     await callback.message.edit_text(
         f"✅ <b>Мероприятие создано!</b>\n\n"
         f"🎯 <b>{full_proj_name}</b>\n"
-        f"📅 Дата: {data.get('event_date', '-')}\n"
         f"📍 Локация: {data.get('location', 'Площадка')}\n"
         f"💵 Смета: {total_price:,.0f} ₸\n"
         f"💰 Предоплата: {paid_amount:,.0f} ₸",
@@ -1412,7 +1481,7 @@ async def process_project_choice(callback: types.CallbackQuery):
     await status_update.edit_text(f"⚠️ Ошибка записи: {e}")
 
 
-# --- ВЕБ-СЕРВЕР И ТОЧКА ВХОДА ДЛЯ RENDER ---
+# --- ВЕБ-СЕРВЕР И ТОЧКА ВХОДА С АВТОПОЧИНКОЙ ПРИ СТАРТЕ ---
 
 
 async def handle_ping(request):
@@ -1427,6 +1496,10 @@ async def main():
   port = int(os.getenv("PORT", 8080))
   site = web.TCPSite(runner, "0.0.0.0", port)
   await site.start()
+
+  # Автоматическая починка формул при каждом запуске/перезапуске сервиса
+  print("Сервер запущен. Проверяем и восстанавливаем формулы в таблице...")
+  await asyncio.to_thread(repair_spreadsheet_sync)
 
   print(f"Сервер слушает порт {port}, запускаем бота...")
   await dp.start_polling(bot)
