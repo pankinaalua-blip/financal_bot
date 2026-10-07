@@ -1,5 +1,5 @@
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime
 import io
 import json
 import os
@@ -16,6 +16,7 @@ from aiogram.types import (
     KeyboardButton,
     ReplyKeyboardMarkup,
 )
+import aiohttp
 from aiohttp import web
 from dotenv import load_dotenv
 from google import genai
@@ -26,6 +27,7 @@ import gspread
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip()
 
 raw_admins = os.getenv("ADMIN_IDS", "")
 ADMIN_IDS = [
@@ -50,7 +52,40 @@ waiting_for_requisites = {}
 saved_receipt_file_ids = set()
 
 
-# Функция защиты от ошибки 503 (3.6 в приоритете + авто-повтор)
+# --- СВЯЗКА: РАСПОЗНАВАНИЕ ЧЕРЕЗ ЯНДЕКС SPEECHKIT ---
+
+
+async def recognize_speech_yandex(audio_bytes: bytes) -> str | None:
+  """Распознает голосовое сообщение через Яндекс SpeechKit STT v1"""
+  if not YANDEX_API_KEY:
+    print("YANDEX_API_KEY не задан, переключаюсь на Gemini...")
+    return None
+
+  url = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
+  headers = {"Authorization": f"Api-Key {YANDEX_API_KEY}"}
+  params = {"topic": "general", "lang": "ru-RU", "format": "oggopus"}
+
+  try:
+    async with aiohttp.ClientSession() as session:
+      async with session.post(
+          url, headers=headers, params=params, data=audio_bytes, timeout=10
+      ) as resp:
+        if resp.status == 200:
+          data = await resp.json()
+          recognized_text = data.get("result", "").strip()
+          if recognized_text:
+            return recognized_text
+        else:
+          err = await resp.text()
+          print(f"Ошибка Яндекс SpeechKit ({resp.status}): {err}")
+  except Exception as e:
+    print(f"Исключение при запросе к Яндекс SpeechKit: {e}")
+  return None
+
+
+# --- ЗАЩИТНЫЙ КАСКАД GEMINI (С АВТОПОВТОРОМ ОТ 503) ---
+
+
 async def call_gemini_safe(contents, json_mode: bool = True):
   models_cascade = [
       "gemini-3.6-flash",
@@ -78,7 +113,7 @@ async def call_gemini_safe(contents, json_mode: bool = True):
       if resp and resp.text:
         return resp.text
     except Exception as e:
-      print(f"Попытка на {model_name} временно не прошла ({e})...")
+      print(f"Попытка Gemini на {model_name} временно не прошла ({e})...")
       if idx == 0:
         await asyncio.sleep(1.0)
       else:
@@ -1079,7 +1114,7 @@ async def process_fast_expense_details(
     await status_msg.edit_text(f"⚠️ Ошибка разбора: {e}")
 
 
-# --- УНИВЕРСАЛЬНОЕ СОЗДАНИЕ ПРОЕКТА (ГОЛОС И ТЕКСТ) ---
+# --- УНИВЕРСАЛЬНОЕ СОЗДАНИЕ ПРОЕКТА (ЯНДЕКС STT + GEMINI) ---
 
 
 @dp.callback_query(F.data == "admin_create_project")
@@ -1093,7 +1128,8 @@ async def cb_start_project_creation(
   await state.set_state(ProjectCreationState.waiting_for_input)
   await callback.message.edit_text(
       "➕ <b>Создание нового мероприятия</b>\n\n"
-      "🎙 <b>Надиктуйте голосовое</b> ИЛИ ✍️ <b>напишите текстом:</b>\n\n"
+      "🎙 <b>Надиктуйте голосовое</b> (распознает Яндекс) ИЛИ ✍️ <b>напишите"
+      " текстом:</b>\n\n"
       "<i>Пример текста:\n«25.09 Концерт Баста, Дворец Спорта, смета 1.5 млн,"
       " предоплата 50%»</i>\n\n"
       "Жду аудио или текст...",
@@ -1102,6 +1138,7 @@ async def cb_start_project_creation(
 
 
 async def render_project_card(target, data: dict):
+  transcript = data.get("transcript", "")
   event_date = data.get("event_date", "-")
   proj_name = data.get("project_name", "-")
   location = data.get("location", "-")
@@ -1109,8 +1146,11 @@ async def render_project_card(target, data: dict):
   prepay_pct = int(data.get("prepay_percent", 0))
   paid_preview = price * (prepay_pct / 100.0)
 
+  transcript_block = f"🗣 <i>«{transcript}»</i>\n\n" if transcript else ""
+
   text = (
       "📋 <b>Проверьте данные проекта:</b>\n\n"
+      f"{transcript_block}"
       f"📅 <b>Дата:</b> {event_date}\n"
       f"🎯 <b>Название:</b> {proj_name}\n"
       f"📍 <b>Площадка:</b> {location}\n"
@@ -1145,34 +1185,58 @@ async def render_project_card(target, data: dict):
     await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 
-async def parse_project_with_gemini(
-    message: types.Message, state: FSMContext, contents
+async def parse_project_with_ai(
+    message: types.Message, state: FSMContext, input_data
 ):
-  status_msg = await message.answer("🤖 Распознаю проект (Gemini)...")
+  status_msg = await message.answer("🎧 Распознаю проект...")
+
   prompt = """
     Ты финансовый ассистент компании аренды сценического оборудования.
     Извлеки данные о проекте и верни ТОЛЬКО валидный JSON:
     {
-      "event_date": "дата ДД.ММ",
-      "project_name": "название без даты (например: Концерт Баста)",
+      "event_date": "дата ДД.ММ (если не названа, текущая)",
+      "project_name": "название события без даты (например: Концерт Баста)",
       "location": "площадка / отель",
-      "price": общая сумма числом,
+      "price": общая сумма сметы числом,
       "prepay_percent": 0, 50 или 100
     }
     """
+
+  recognized_text = ""
+
   try:
-    if isinstance(contents, bytes):
-      parts = [
-          genai_types.Part.from_bytes(data=contents, mime_type="audio/ogg"),
+    if isinstance(input_data, bytes):
+      # Сначала пытаемся распознать через Яндекс SpeechKit
+      await status_msg.edit_text("🎧 Слушаю аудио через Яндекс SpeechKit...")
+      recognized_text = await recognize_speech_yandex(input_data)
+
+      if recognized_text:
+        # Успешно распознано Яндексом: отправляем текст на структурирование в Gemini
+        await status_msg.edit_text("🤖 Структурирую данные проекта...")
+        contents = [
+            f"Текст администратора: \"{recognized_text}\"",
+            prompt,
+        ]
+      else:
+        # Если Яндекс не ответил, используем прямой разбор аудио в Gemini как резерв
+        await status_msg.edit_text("🤖 Разбираю проект через резервный канал...")
+        contents = [
+            genai_types.Part.from_bytes(
+                data=input_data, mime_type="audio/ogg"
+            ),
+            prompt,
+        ]
+    else:
+      recognized_text = input_data
+      contents = [
+          f"Текст администратора: \"{recognized_text}\"",
           prompt,
       ]
-    else:
-      parts = [contents, prompt]
 
-    resp_text = await call_gemini_safe(parts, json_mode=True)
+    resp_text = await call_gemini_safe(contents, json_mode=True)
     if not resp_text:
       await status_msg.edit_text(
-          "⚠️ Серверы временно перегружены. Попробуйте еще раз."
+          "⚠️ Не удалось разобрать проект. Попробуйте еще раз."
       )
       return
 
@@ -1183,6 +1247,7 @@ async def parse_project_with_gemini(
 
     await state.set_state(ProjectCreationState.waiting_for_input)
     await state.update_data(
+        transcript=recognized_text,
         event_date=data.get("event_date", datetime.now().strftime("%d.%m")),
         project_name=data.get("project_name", "Мероприятие"),
         location=data.get("location", "Не указана"),
@@ -1190,22 +1255,25 @@ async def parse_project_with_gemini(
         prepay_percent=int(data.get("prepay_percent", 0)),
     )
     await render_project_card(status_msg, await state.get_data())
+
   except Exception as e:
     await status_msg.edit_text(f"⚠️ Ошибка разбора: {e}")
 
 
+# Прием голоса для проекта
 @dp.message(ProjectCreationState.waiting_for_input, F.voice | F.audio)
 @dp.message(F.from_user.id.in_(ADMIN_IDS), F.voice | F.audio)
 async def process_project_voice(message: types.Message, state: FSMContext):
   voice_obj = message.voice or message.audio
   file_io = io.BytesIO()
   await bot.download(voice_obj, destination=file_io)
-  await parse_project_with_gemini(message, state, file_io.getvalue())
+  await parse_project_with_ai(message, state, file_io.getvalue())
 
 
+# Прием текста для проекта
 @dp.message(ProjectCreationState.waiting_for_input, F.text)
 async def process_project_text(message: types.Message, state: FSMContext):
-  await parse_project_with_gemini(message, state, message.text.strip())
+  await parse_project_with_ai(message, state, message.text.strip())
 
 
 @dp.callback_query(F.data == "edit_voice_fields_menu")
@@ -1572,7 +1640,7 @@ async def handle_photo(message: types.Message):
 
     if not resp_text:
       await status_msg.edit_text(
-          "⚠️ Серверы Google перегружены. Пожалуйста, отправьте чек еще раз"
+          "⚠️ Серверы временно перегружены. Пожалуйста, отправьте чек еще раз"
           " через секунду."
       )
       return
