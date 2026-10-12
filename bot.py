@@ -1,10 +1,12 @@
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 import io
 import json
 import os
 import random
 import re
+from zoneinfo import ZoneInfo
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
@@ -23,16 +25,27 @@ from google import genai
 from google.genai import types as genai_types
 import gspread
 
-# 1. Загрузка переменных окружения
+# 1. Загрузка конфигурации
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 YANDEX_API_KEY = os.getenv("YANDEX_API_KEY", "").strip()
 
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "disa2026").strip()
+MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "disa_manager").strip()
+
 raw_admins = os.getenv("ADMIN_IDS", "")
-ADMIN_IDS = [
+INITIAL_ADMINS = [
     int(x.strip()) for x in raw_admins.split(",") if x.strip().isdigit()
 ]
+
+# Часовой пояс Астаны (UTC+5)
+TZ_ASTANA = ZoneInfo("Asia/Almaty")
+
+
+def get_now_astana() -> datetime:
+  return datetime.now(TZ_ASTANA)
+
 
 SPREADSHEET_ID = "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA"
 
@@ -45,26 +58,60 @@ ai_client = genai.Client(api_key=GEMINI_KEY)
 gc = gspread.service_account(filename="credentials.json")
 spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
+authenticated_admins = set(INITIAL_ADMINS)
+authenticated_managers = set()
 employee_cache = {}
+
 pending_receipts = {}
 active_shifts = {}
 waiting_for_requisites = {}
+pending_shift_requests = {}
 saved_receipt_file_ids = set()
 
 
-# --- СВЯЗКА: РАСПОЗНАВАНИЕ ЧЕРЕЗ ЯНДЕКС SPEECHKIT ---
+# --- ПРОВЕРКА РОЛЕЙ ---
+
+
+def is_admin(user_id: int) -> bool:
+  return user_id in authenticated_admins
+
+
+def is_manager_or_admin(user_id: int) -> bool:
+  return user_id in authenticated_admins or user_id in authenticated_managers
+
+
+def load_managers_from_sheets_sync():
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    rows = ws_pay.get_all_values()
+    ws_ref = spreadsheet.worksheet("Справочники")
+    ref_rows = ws_ref.get_all_records()
+
+    manager_names = set()
+    for row in rows[1:]:
+      if len(row) >= 2:
+        name, role = row[0].strip(), row[1].strip().lower()
+        if "управл" in role or "менедж" in role or "admin" in role:
+          manager_names.add(name.lower())
+
+    for r in ref_rows:
+      name = str(r.get("Имя", "")).strip().lower()
+      chat_id = str(r.get("Chat ID", "")).strip()
+      if name in manager_names and chat_id.isdigit():
+        authenticated_managers.add(int(chat_id))
+  except Exception as e:
+    print(f"Ошибка загрузки менеджеров: {e}")
+
+
+# --- ИИ: YANDEX SPEECHKIT + КАСКАД GEMINI 3.6 ---
 
 
 async def recognize_speech_yandex(audio_bytes: bytes) -> str | None:
-  """Распознает голосовое сообщение через Яндекс SpeechKit STT v1"""
   if not YANDEX_API_KEY:
-    print("YANDEX_API_KEY не задан, переключаюсь на Gemini...")
     return None
-
   url = "https://stt.api.cloud.yandex.net/speech/v1/stt:recognize"
   headers = {"Authorization": f"Api-Key {YANDEX_API_KEY}"}
   params = {"topic": "general", "lang": "ru-RU", "format": "oggopus"}
-
   try:
     async with aiohttp.ClientSession() as session:
       async with session.post(
@@ -72,18 +119,10 @@ async def recognize_speech_yandex(audio_bytes: bytes) -> str | None:
       ) as resp:
         if resp.status == 200:
           data = await resp.json()
-          recognized_text = data.get("result", "").strip()
-          if recognized_text:
-            return recognized_text
-        else:
-          err = await resp.text()
-          print(f"Ошибка Яндекс SpeechKit ({resp.status}): {err}")
+          return data.get("result", "").strip()
   except Exception as e:
-    print(f"Исключение при запросе к Яндекс SpeechKit: {e}")
+    print(f"Ошибка SpeechKit: {e}")
   return None
-
-
-# --- ЗАЩИТНЫЙ КАСКАД GEMINI (С АВТОПОВТОРОМ ОТ 503) ---
 
 
 async def call_gemini_safe(contents, json_mode: bool = True):
@@ -94,7 +133,6 @@ async def call_gemini_safe(contents, json_mode: bool = True):
       "gemini-2.0-flash",
       "gemini-1.5-flash",
   ]
-
   config = (
       genai_types.GenerateContentConfig(
           response_mime_type="application/json", temperature=0.1
@@ -102,24 +140,67 @@ async def call_gemini_safe(contents, json_mode: bool = True):
       if json_mode
       else None
   )
-
   for idx, model_name in enumerate(models_cascade):
     try:
       resp = ai_client.models.generate_content(
-          model=model_name,
-          contents=contents,
-          config=config,
+          model=model_name, contents=contents, config=config
       )
       if resp and resp.text:
         return resp.text
     except Exception as e:
-      print(f"Попытка Gemini на {model_name} временно не прошла ({e})...")
-      if idx == 0:
-        await asyncio.sleep(1.0)
-      else:
-        await asyncio.sleep(0.3)
-      continue
+      print(f"Попытка на {model_name} временно не удалась: {e}")
+      await asyncio.sleep(1.0 if idx == 0 else 0.3)
   return None
+
+
+# --- GOOGLE DRIVE: СОХРАНЕНИЕ ЧЕКОВ ---
+
+
+def upload_receipt_to_drive_sync(
+    file_bytes: bytes, filename: str
+) -> str | None:
+  try:
+    creds = gc.auth
+    token = creds.token
+    if not token:
+      creds.refresh(None)
+      token = creds.token
+
+    boundary = "-------314159265358979323846"
+    delimiter = f"\r\n--{boundary}\r\n".encode("utf-8")
+    close_delim = f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+    metadata = {"name": filename, "mimeType": "image/jpeg"}
+    body = (
+        delimiter
+        + b"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        + json.dumps(metadata).encode("utf-8")
+        + delimiter
+        + b"Content-Type: image/jpeg\r\n\r\n"
+        + file_bytes
+        + close_delim
+    )
+
+    import urllib.request
+
+    req = urllib.request.Request(
+        "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,webViewLink",
+        data=body,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": f"multipart/related; boundary={boundary}",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req) as response:
+      res_json = json.loads(response.read().decode("utf-8"))
+      return res_json.get("webViewLink")
+  except Exception as e:
+    print(f"Ошибка загрузки на Google Диск: {e}")
+    return None
+
+
+# --- FSM СОСТОЯНИЯ ---
 
 
 class ProjectCreationState(StatesGroup):
@@ -131,58 +212,57 @@ class QuickExpenseState(StatesGroup):
   waiting_for_details = State()
 
 
+class RetroShiftState(StatesGroup):
+  waiting_for_time = State()
+
+
+class CustomPayoutState(StatesGroup):
+  waiting_for_amount = State()
+
+
 NAV_BUTTONS = [
-    "📸 Как отправить чек",
-    "🍔 Обеденные (2 500 ₸)",
+    "🚕 Такси",
+    "🍔 Обеды",
+    "🧾 Расходы",
     "⏱ Моя смена",
-    "💰 Мои чеки",
+    "💰 Мои выплаты",
     "💳 Мои реквизиты",
-    "💼 Панель выплат (Admin)",
+    "💼 Панель управления",
 ]
 
 
-# --- ИСПРАВЛЕНИЕ ФОРМУЛ ---
+# --- СИНХРОНИЗАЦИЯ ТАБЛИЦЫ ---
 
 
 def repair_spreadsheet_sync():
   try:
     ws_proj = spreadsheet.worksheet("Проекты")
     proj_rows = ws_proj.get_all_values()
-
     for r_idx in range(2, len(proj_rows) + 1):
       proj_name = ws_proj.cell(r_idx, 1).value
       if not proj_name:
         continue
-
       formula_exp = f'=SUMIFS(Операции!F:F; Операции!D:D; A{r_idx}; Операции!C:C; "Расход")'
       formula_prof = f"=D{r_idx}-E{r_idx}"
       formula_marg = f"=IF(D{r_idx}>0; F{r_idx}/D{r_idx}; 0)"
-
       ws_proj.update_cell(r_idx, 5, formula_exp)
       ws_proj.update_cell(r_idx, 6, formula_prof)
       ws_proj.update_cell(r_idx, 7, formula_marg)
 
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     pay_rows = ws_pay.get_all_values()
-
     for r_idx in range(2, len(pay_rows) + 1):
       emp_name = ws_pay.cell(r_idx, 1).value
       if not emp_name:
         continue
-
       formula_debt = f'=SUMIFS(Операции!F:F; Операции!G:G; A{r_idx}; Операции!H:H; "К возмещению")'
       formula_paid = f'=SUMIFS(Операции!F:F; Операции!G:G; A{r_idx}; Операции!H:H; "Выплачено")'
-
       ws_pay.update_cell(r_idx, 4, formula_debt)
       ws_pay.update_cell(r_idx, 5, formula_paid)
-
     return True
   except Exception as e:
-    print(f"Ошибка при починке таблицы: {e}")
+    print(f"Ошибка починки формул: {e}")
     return False
-
-
-# --- СИНХРОНИЗАЦИЯ СОТРУДНИКОВ ---
 
 
 def get_or_register_employee_sync(user: types.User) -> str:
@@ -197,12 +277,10 @@ def get_or_register_employee_sync(user: types.User) -> str:
   try:
     ws_ref = spreadsheet.worksheet("Справочники")
     records = ws_ref.get_all_records()
-
     for r in records:
       chat_id = str(r.get("Chat ID", "")).strip()
       tg_nick = str(r.get("Telegram никнейм", "")).strip().lower()
       name = str(r.get("Имя", "")).strip()
-
       if user_id_str and chat_id == user_id_str:
         official_name = name
         break
@@ -222,7 +300,6 @@ def get_or_register_employee_sync(user: types.User) -> str:
 
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
-
     if official_name not in col_names:
       next_row = len(col_names) + 1
       formula_debt = f'=SUMIFS(Операции!F:F; Операции!G:G; A{next_row}; Операции!H:H; "К возмещению")'
@@ -231,9 +308,8 @@ def get_or_register_employee_sync(user: types.User) -> str:
           [official_name, "Команда", "-", formula_debt, formula_paid],
           value_input_option="USER_ENTERED",
       )
-
   except Exception as e:
-    print(f"Ошибка синхронизации сотрудника: {e}")
+    print(f"Ошибка сотрудника: {e}")
     official_name = official_name or full_name
 
   employee_cache[user_id_str] = official_name
@@ -265,7 +341,7 @@ def get_employee_requisites_sync(employee_name: str) -> str:
           return reqs.lstrip("'")
         return "Реквизиты еще не указаны"
   except Exception as e:
-    print(f"Ошибка чтения реквизитов: {e}")
+    print(f"Ошибка реквизитов: {e}")
   return "Реквизиты еще не указаны"
 
 
@@ -273,7 +349,6 @@ def save_employee_requisites_sync(employee_name: str, requisites_text: str):
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     col_names = ws_pay.col_values(1)
-
     matched_idx = None
     for idx, name in enumerate(col_names, start=1):
       if (
@@ -282,7 +357,6 @@ def save_employee_requisites_sync(employee_name: str, requisites_text: str):
       ) and name.strip():
         matched_idx = idx
         break
-
     if matched_idx:
       clean_text = requisites_text.strip()
       if clean_text.startswith(("+", "=")):
@@ -292,27 +366,50 @@ def save_employee_requisites_sync(employee_name: str, requisites_text: str):
     print(f"Ошибка сохранения реквизитов: {e}")
 
 
-# --- УМНАЯ ФИЛЬТРАЦИЯ И СМЕНА СТАТУСА ПРОЕКТОВ ---
+def get_all_team_roles_sync():
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    rows = ws_pay.get_all_values()
+    team = []
+    for row in rows[1:]:
+      if row and row[0].strip():
+        name = row[0].strip()
+        role = row[1].strip() if len(row) > 1 else "Команда"
+        team.append((name, role))
+    return team
+  except Exception as e:
+    print(f"Ошибка чтения ролей: {e}")
+    return []
+
+
+def set_employee_role_sync(employee_name: str, new_role: str):
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    col_names = ws_pay.col_values(1)
+    for idx, name in enumerate(col_names, start=1):
+      if name.strip().lower() == employee_name.strip().lower():
+        ws_pay.update_cell(idx, 2, new_role)
+        return True
+  except Exception as e:
+    print(f"Ошибка смены роли: {e}")
+  return False
 
 
 def get_filtered_projects_sync(show_all: bool = False) -> list[str]:
   try:
     ws = spreadsheet.worksheet("Проекты")
     rows = ws.get_all_records()
-    now = datetime.now()
+    now = get_now_astana()
     current_year = now.year
 
     filtered = []
     for r in rows:
       proj = str(r.get("Проект", "")).strip()
       status = str(r.get("Статус проекта", "")).strip().lower()
-
       if not proj or status in ["завершен", "архив", "отменен"]:
         continue
-
       if proj == "Склад / Общее":
         continue
-
       if show_all:
         filtered.append(proj)
         continue
@@ -321,9 +418,8 @@ def get_filtered_projects_sync(show_all: bool = False) -> list[str]:
       if date_match:
         try:
           day, month = int(date_match.group(1)), int(date_match.group(2))
-          p_date = datetime(current_year, month, day)
+          p_date = datetime(current_year, month, day, tzinfo=TZ_ASTANA)
           diff_days = (p_date.date() - now.date()).days
-
           if -3 <= diff_days <= 10:
             filtered.append(proj)
         except ValueError:
@@ -364,7 +460,7 @@ def set_project_status_sync(
           return proj_name
     return None
   except Exception as e:
-    print(f"Ошибка изменения статуса проекта: {e}")
+    print(f"Ошибка статуса: {e}")
     return None
 
 
@@ -377,12 +473,17 @@ def log_expense_sync(
     check_type: str = "Норматив (без чека)",
     payer: str = None,
     status: str = "К возмещению",
+    drive_link: str = None,
+    tx_id: str = None,
 ):
   employee = payer if payer else get_or_register_employee_sync(user)
   ws = spreadsheet.worksheet("Операции")
-  tx_id = f"TX-{random.randint(10000, 99999)}"
-  now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
+  tx_id = tx_id if tx_id else f"TX-{random.randint(10000, 99999)}"
+  now_str = get_now_astana().strftime("%d.%m.%Y %H:%M")
 
+  check_val = (
+      f'=HYPERLINK("{drive_link}"; "📎 Чек")' if drive_link else check_type
+  )
   ws.append_row(
       [
           tx_id,
@@ -393,100 +494,30 @@ def log_expense_sync(
           amount,
           employee,
           status,
-          check_type,
+          check_val,
           comment,
       ],
       value_input_option="USER_ENTERED",
   )
 
 
-def check_for_duplicate_receipt_sync(
-    employee: str, amount: float, merchant: str
-) -> dict | None:
+def update_expense_status_sync(tx_id: str, new_status: str):
   try:
     ws = spreadsheet.worksheet("Операции")
-    rows = ws.get_all_records()
-    today_str = datetime.now().strftime("%d.%m.%Y")
-
-    for r in reversed(rows[-50:]):
-      dt = str(r.get("Дата и время", ""))
-      who = str(r.get("Кто оплатил", "")).strip().lower()
-      comm = str(r.get("Комментарий", "")).lower()
-
-      try:
-        amt = float(
-            str(r.get("Сумма (₸)", 0)).replace(" ", "").replace(",", ".")
-        )
-      except ValueError:
-        amt = 0.0
-
-      if (
-          today_str in dt
-          and (employee.lower() in who or who in employee.lower())
-          and abs(amt - amount) < 0.01
-      ):
-        if (
-            merchant.lower() in comm
-            or not merchant
-            or merchant == "Неизвестно"
-        ):
-          return {
-              "time": dt.split(" ")[-1] if " " in dt else dt,
-              "project": r.get("Проект", "-"),
-              "amount": amt,
-              "comment": r.get("Комментарий", "-"),
-          }
+    all_values = ws.get_all_values()
+    for r_idx, row in enumerate(all_values[1:], start=2):
+      if row and row[0].strip() == tx_id:
+        ws.update_cell(r_idx, 8, new_status)
+        return True
   except Exception as e:
-    print(f"Ошибка проверки дубликатов: {e}")
-  return None
-
-
-async def render_project_keyboard(
-    callback_prefix: str, show_all: bool = False
-) -> InlineKeyboardMarkup:
-  projects = await asyncio.to_thread(get_filtered_projects_sync, show_all)
-  kb_buttons = [
-      [
-          InlineKeyboardButton(
-              text=f"📌 {p}", callback_data=f"{callback_prefix}_{p[:25]}"
-          )
-      ]
-      for p in projects
-  ]
-
-  if not show_all:
-    kb_buttons.append([
-        InlineKeyboardButton(
-            text="📂 Показать все проекты",
-            callback_data=f"{callback_prefix}_showall",
-        )
-    ])
-  return InlineKeyboardMarkup(inline_keyboard=kb_buttons)
-
-
-async def show_project_selection(
-    target_msg, amount: float, merchant: str, data: dict, employee: str
-):
-  kb = await render_project_keyboard("proj", show_all=False)
-  text = (
-      f"🧾 <b>Чек:</b> {amount:,.0f} ₸ ({merchant})\n"
-      f"📂 {data.get('category', 'Прочее')} — {data.get('description', '')}\n"
-      f"👤 Сотрудник: <b>{employee}</b>\n\n"
-      "👉 <b>К какому проекту привязать покупку?</b>\n"
-      "<i>(Показаны актуальные на эту неделю)</i>"
-  )
-
-  if isinstance(target_msg, types.Message):
-    await target_msg.edit_text(text, reply_markup=kb, parse_mode="HTML")
-  else:
-    await target_msg.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    print(f"Ошибка обновления статуса TX: {e}")
+  return False
 
 
 def get_debts_summary_sync():
   ws = spreadsheet.worksheet("Операции")
   rows = ws.get_all_records()
   debts = {}
-
   for r in rows:
     status, who, amount_raw = "", "", 0
     for k, v in r.items():
@@ -497,7 +528,6 @@ def get_debts_summary_sync():
         who = str(v).strip()
       elif "сумм" in k_lower or "₸" in k_lower:
         amount_raw = v
-
     if "к возмещению" in status and who:
       try:
         amount = float(str(amount_raw).replace(" ", "").replace(",", "."))
@@ -513,11 +543,9 @@ def get_user_pending_receipts_sync(user: types.User):
   rows = ws.get_all_records()
   user_items = []
   total = 0.0
-
   for r in rows:
     status, who, amount_raw = "", "", 0
     proj, comm, dt = "-", "-", "-"
-
     for k, v in r.items():
       k_lower = str(k).lower()
       if "статус" in k_lower:
@@ -532,7 +560,6 @@ def get_user_pending_receipts_sync(user: types.User):
         comm = str(v)
       elif "дата" in k_lower:
         dt = str(v)
-
     if (
         employee_name.lower() in who.lower()
         or who.lower() in employee_name.lower()
@@ -548,25 +575,163 @@ def get_user_pending_receipts_sync(user: types.User):
   return employee_name, total, user_items
 
 
+def process_custom_payout_sync(
+    employee_name: str, payout_amount: float, current_debt: float
+):
+  ws = spreadsheet.worksheet("Операции")
+  all_values = ws.get_all_values()
+  if not all_values:
+    return False
+
+  headers = [str(h).strip().lower() for h in all_values[0]]
+  status_col_idx = 8
+  who_col_idx = 7
+  for idx, h in enumerate(headers, start=1):
+    if "статус" in h:
+      status_col_idx = idx
+    elif "кто" in h or "сотрудник" in h:
+      who_col_idx = idx
+
+  for row_idx, row in enumerate(all_values[1:], start=2):
+    if len(row) >= max(status_col_idx, who_col_idx):
+      who_val = row[who_col_idx - 1].strip()
+      status_val = row[status_col_idx - 1].strip().lower()
+      if (
+          employee_name.lower() in who_val.lower()
+          or who_val.lower() in employee_name.lower()
+      ) and "к возмещению" in status_val:
+        ws.update_cell(row_idx, status_col_idx, "Выплачено")
+
+  diff = payout_amount - current_debt
+  now_str = get_now_astana().strftime("%d.%m.%Y %H:%M")
+  tx_id = f"TX-{random.randint(10000, 99999)}"
+
+  if diff > 0.01:
+    ws.append_row(
+        [
+            tx_id,
+            now_str,
+            "Расход",
+            "Склад / Общее",
+            "Взаиморасчеты",
+            -diff,
+            employee_name,
+            "К возмещению",
+            "Перевод Kaspi",
+            (
+                f"Аванс / переплата на баланс (выплачено {payout_amount:,.0f} ₸"
+                f" при долге {current_debt:,.0f} ₸)"
+            ),
+        ],
+        value_input_option="USER_ENTERED",
+    )
+  elif diff < -0.01:
+    remaining_debt = abs(diff)
+    ws.append_row(
+        [
+            tx_id,
+            now_str,
+            "Расход",
+            "Склад / Общее",
+            "Взаиморасчеты",
+            remaining_debt,
+            employee_name,
+            "К возмещению",
+            "Перевод Kaspi",
+            (
+                f"Остаток долга после частичной выплаты {payout_amount:,.0f} ₸"
+                f" (долг был {current_debt:,.0f} ₸)"
+            ),
+        ],
+        value_input_option="USER_ENTERED",
+    )
+  return True
+
+
+# --- КЛАВИАТУРЫ ---
+
+
 def get_main_keyboard(user_id: int) -> ReplyKeyboardMarkup:
   keyboard = [
+      [KeyboardButton(text="🚕 Такси"), KeyboardButton(text="🍔 Обеды")],
       [
-          KeyboardButton(text="📸 Как отправить чек"),
-          KeyboardButton(text="🍔 Обеденные (2 500 ₸)"),
-      ],
-      [
+          KeyboardButton(text="🧾 Расходы"),
           KeyboardButton(text="⏱ Моя смена"),
-          KeyboardButton(text="💰 Мои чеки"),
       ],
-      [KeyboardButton(text="💳 Мои реквизиты")],
+      [
+          KeyboardButton(text="💰 Мои выплаты"),
+          KeyboardButton(text="💳 Мои реквизиты"),
+      ],
   ]
-  if user_id in ADMIN_IDS:
-    keyboard.append([KeyboardButton(text="💼 Панель выплат (Admin)")])
-
+  if is_manager_or_admin(user_id):
+    keyboard.append([KeyboardButton(text="💼 Панель управления")])
   return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
 
 
-# --- ОБРАБОТЧИКИ КОМАНД ---
+async def render_project_keyboard(
+    callback_prefix: str, show_all: bool = False
+) -> InlineKeyboardMarkup:
+  projects = await asyncio.to_thread(get_filtered_projects_sync, show_all)
+  kb_buttons = [
+      [
+          InlineKeyboardButton(
+              text=f"📌 {p}", callback_data=f"{callback_prefix}_{p[:25]}"
+          )
+      ]
+      for p in projects
+  ]
+  if not show_all:
+    kb_buttons.append([
+        InlineKeyboardButton(
+            text="📂 Показать все проекты",
+            callback_data=f"{callback_prefix}_showall",
+        )
+    ])
+  return InlineKeyboardMarkup(inline_keyboard=kb_buttons)
+
+
+# --- АВТОРИЗАЦИЯ ГЛАВНОГО АДМИНА И МЕНЕДЖЕРОВ ---
+
+
+@dp.message(Command("login"))
+async def cmd_login(message: types.Message):
+  args = message.text.split(maxsplit=1)
+  if len(args) < 2:
+    await message.answer(
+        "⚠️ Введите пароль: <code>/login ваш_пароль</code>", parse_mode="HTML"
+    )
+    return
+  if args[1].strip() == ADMIN_PASSWORD:
+    authenticated_admins.add(message.from_user.id)
+    await message.answer(
+        "🔓 <b>Доступ главного администратора активирован!</b>",
+        reply_markup=get_main_keyboard(message.from_user.id),
+        parse_mode="HTML",
+    )
+  else:
+    await message.answer("⛔️ Неверный пароль.")
+
+
+@dp.message(Command("manager"))
+async def cmd_manager_login(message: types.Message):
+  args = message.text.split(maxsplit=1)
+  if len(args) < 2:
+    await message.answer(
+        "⚠️ Введите пароль: <code>/manager пароль</code>", parse_mode="HTML"
+    )
+    return
+  if args[1].strip() == MANAGER_PASSWORD:
+    authenticated_managers.add(message.from_user.id)
+    await message.answer(
+        "🔓 <b>Доступ управляющего проектами активирован!</b>",
+        reply_markup=get_main_keyboard(message.from_user.id),
+        parse_mode="HTML",
+    )
+  else:
+    await message.answer("⛔️ Неверный пароль управляющего.")
+
+
+# --- ОСНОВНЫЕ ОБРАБОТЧИКИ ---
 
 
 @dp.message(CommandStart())
@@ -574,65 +739,40 @@ async def cmd_start(message: types.Message):
   name = await get_or_register_employee(message.from_user)
   kb = get_main_keyboard(message.from_user.id)
   await message.answer(
-      f"Привет, {name}! 🎛️\n\n"
-      "Я бот для учета расходов на площадках.\n"
-      "• Отправь фото чека для распознавания\n"
-      "• Жми «🍔 Обеденные» для суточных 2 500 ₸\n"
-      "• Запускай «⏱ Моя смена» для учета времени.",
+      f"Привет, {name}! 🎛️ (Время Астаны: {get_now_astana().strftime('%H:%M')})\n\n"
+      "Бот учета сценического оборудования готов к работе:\n"
+      "• 🚕 <b>Такси</b> — ночные поездки (22:00–07:00) сразу к выплате\n"
+      "• 🍔 <b>Обеды</b> — начисление обеденных 2 500 ₸\n"
+      "• 🧾 <b>Расходы</b> — отправка любых чеков по проектам\n"
+      "• ⏱ <b>Моя смена</b> — фиксация рабочих часов",
       reply_markup=kb,
       parse_mode="HTML",
   )
 
 
-@dp.message(Command("fix"))
-async def cmd_fix_tables(message: types.Message):
-  if message.from_user.id not in ADMIN_IDS:
-    return
-  wait_m = await message.answer("⏳ Исправляю формулы в Google Таблице...")
-  ok = await asyncio.to_thread(repair_spreadsheet_sync)
-  if ok:
-    await wait_m.edit_text(
-        "✅ Формулы в таблице восстановлены!", parse_mode="HTML"
-    )
-  else:
-    await wait_m.edit_text("⚠️ Ошибка при обновлении таблицы.")
-
-
-@dp.message(F.text == "📸 Как отправить чек")
-async def msg_how_to(message: types.Message):
-  await message.answer(
-      "📷 <b>Как отправить чек:</b>\n\n"
-      "1. Нажмите на скрепку и отправьте фото чека (или скриншот Kaspi / Яндекс"
-      " Go).\n"
-      "2. Gemini автоматически определит сумму и категорию расхода.\n"
-      "3. Выберите проект кнопкой.",
-      parse_mode="HTML",
-  )
-
-
-@dp.message(F.text == "💰 Мои чеки")
-async def msg_my_receipts(message: types.Message):
-  status_wait = await message.answer("🔍 Проверяю ваши чеки...")
+@dp.message(F.text == "💰 Мои выплаты")
+async def msg_my_payouts(message: types.Message):
+  status_wait = await message.answer("🔍 Проверяю ваш баланс...")
   name, total, items = await asyncio.to_thread(
       get_user_pending_receipts_sync, message.from_user
   )
-
-  if not items:
-    await status_wait.edit_text(
-        f"👤 <b>{name}</b>\n\nУ вас нет активных чеков к возмещению.",
-        parse_mode="HTML",
+  if total < -0.01:
+    balance_text = (
+        f"🟢 <b>Аванс / переплата на вашем балансе:</b> {abs(total):,.0f} ₸\n<i>(Будет"
+        " автоматически зачтен в счет будущих чеков)</i>"
     )
-    return
+  elif total > 0.01:
+    balance_text = f"💰 <b>К возмещению вам:</b> {total:,.0f} ₸"
+  else:
+    balance_text = "🎉 Все чеки выплачены! Баланс нулевой."
 
-  text = (
-      f"👤 <b>Чеки к возмещению ({name})</b>\n\n💰 <b>Итого:</b> {total:,.0f}"
-      " ₸\n\n"
-  )
-  for it in items[:10]:
-    text += (
-        f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
-    )
-
+  text = f"👤 <b>Финансовый баланс ({name})</b>\n\n{balance_text}\n\n"
+  if items:
+    text += "<b>История операций:</b>\n"
+    for it in items[:10]:
+      text += (
+          f"• {it['amount']:,.0f} ₸ — <i>{it['project']}</i> ({it['comment']})\n"
+      )
   await status_wait.edit_text(text, parse_mode="HTML")
 
 
@@ -640,7 +780,6 @@ async def msg_my_receipts(message: types.Message):
 async def cmd_my_requisites(message: types.Message):
   employee = await get_or_register_employee(message.from_user)
   reqs = await asyncio.to_thread(get_employee_requisites_sync, employee)
-
   kb = InlineKeyboardMarkup(
       inline_keyboard=[[
           InlineKeyboardButton(
@@ -649,9 +788,8 @@ async def cmd_my_requisites(message: types.Message):
       ]]
   )
   await message.answer(
-      f"💳 <b>Реквизиты для выплат:</b>\n\n"
-      f"👤 <b>Сотрудник:</b> {employee}\n"
-      f"📋 <b>Данные:</b>\n<code>{reqs}</code>",
+      f"💳 <b>Реквизиты для выплат:</b>\n\n👤 <b>Сотрудник:</b> {employee}\n📋"
+      f" <code>{reqs}</code>",
       reply_markup=kb,
       parse_mode="HTML",
   )
@@ -660,21 +798,43 @@ async def cmd_my_requisites(message: types.Message):
 @dp.callback_query(F.data == "edit_reqs")
 async def cb_edit_requisites(callback: types.CallbackQuery):
   await callback.answer()
-  user_id = callback.from_user.id
-  waiting_for_requisites[user_id] = True
+  waiting_for_requisites[callback.from_user.id] = True
   await callback.message.edit_text(
-      "📝 <b>Введите ваши реквизиты (Kaspi номер, ИИН):</b>", parse_mode="HTML"
+      "📝 <b>Введите ваши реквизиты (Kaspi номер, ИИН, карта):</b>",
+      parse_mode="HTML",
   )
 
 
-# --- ОБЕДЕННЫЕ И СМЕНЫ ---
+# --- РАЗДЕЛ: ТАКСИ ---
 
 
-@dp.message(F.text == "🍔 Обеденные (2 500 ₸)")
-async def cmd_quick_meal(message: types.Message):
+@dp.message(F.text == "🚕 Такси")
+async def cmd_taxi_menu(message: types.Message):
+  now = get_now_astana()
+  is_night = now.hour >= 22 or now.hour < 7
+  status_info = (
+      "🌙 <b>Сейчас ночной режим (22:00–07:00):</b> поездка подтверждается"
+      " автоматически!"
+      if is_night
+      else "☀️ <b>Сейчас дневной режим:</b> поездка потребует согласования"
+      " управляющего/админа."
+  )
+  await message.answer(
+      f"🚕 <b>Учет поездки на такси</b>\n\n"
+      f"🕒 Время Астаны: <b>{now.strftime('%H:%M')}</b>\n{status_info}\n\n"
+      "Отправьте <b>скриншот / чек поездки</b> из Яндекс Go в этот чат:",
+      parse_mode="HTML",
+  )
+
+
+# --- РАЗДЕЛ: ОБЕДЫ ---
+
+
+@dp.message(F.text == "🍔 Обеды")
+async def cmd_meals_menu(message: types.Message):
   kb = await render_project_keyboard("meal", show_all=False)
   await message.answer(
-      "🍔 <b>Обеденные (2 500 ₸)</b>\nВыберите проект на эту неделю:",
+      "🍔 <b>Обеденные (2 500 ₸)</b>\nВыберите проект, на котором работаете:",
       reply_markup=kb,
       parse_mode="HTML",
   )
@@ -689,16 +849,15 @@ async def cb_meal_showall(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("meal_") & (F.data != "meal_showall"))
 async def cb_confirm_meal(callback: types.CallbackQuery):
-  await callback.answer("Записываю обеденные...")
+  await callback.answer("Записываю...")
   project_short = callback.data.replace("meal_", "")
   projects = await asyncio.to_thread(get_filtered_projects_sync, True)
   full_project = next(
       (p for p in projects if p.startswith(project_short)), "Склад / Общее"
   )
 
-  user_id = callback.from_user.id
-  if user_id in active_shifts:
-    active_shifts[user_id]["claimed_meals"] += 1
+  if callback.from_user.id in active_shifts:
+    active_shifts[callback.from_user.id]["claimed_meals"] += 1
 
   await asyncio.to_thread(
       log_expense_sync,
@@ -708,50 +867,81 @@ async def cb_confirm_meal(callback: types.CallbackQuery):
       callback.from_user,
       "Обеденные (быстрая выплата)",
   )
-
   await callback.message.edit_text(
       f"✅ <b>Обеденные 2 500 ₸ начислены!</b>\n🎯 Проект: {full_project}",
       parse_mode="HTML",
   )
 
 
+# --- РАЗДЕЛ: СМЕНА ---
+
+
 @dp.message(F.text == "⏱ Моя смена")
 async def cmd_shift_menu(message: types.Message):
   user_id = message.from_user.id
   if user_id not in active_shifts:
-    kb = await render_project_keyboard("startshift", show_all=False)
-    await message.answer(
-        "⏱ <b>Учет смены</b>\nВыберите проект для старта:",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-  else:
-    shift = active_shifts[user_id]
-    duration = datetime.now() - shift["start_time"]
-    hours = int(duration.total_seconds() // 3600)
-    minutes = int((duration.total_seconds() % 3600) // 60)
-
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="🔴 Завершить смену", callback_data="end_shift"
+                    text="🟢 Начать прямо сейчас", callback_data="shift_mode_now"
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="🍔 Взять обед сейчас (2 500 ₸)",
-                    callback_data=f"meal_{shift['project'][:25]}",
+                    text="🕒 Начать задним числом",
+                    callback_data="shift_mode_retro",
                 )
             ],
         ]
     )
     await message.answer(
+        "⏱ <b>Учет рабочего времени</b>\nУ вас нет активной смены. Как хотите"
+        " начать?",
+        reply_markup=kb,
+        parse_mode="HTML",
+    )
+  else:
+    shift = active_shifts[user_id]
+    duration = get_now_astana() - shift["start_time"]
+    hours = int(duration.total_seconds() // 3600)
+    minutes = int((duration.total_seconds() % 3600) // 60)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🔴 Завершить смену", callback_data="end_shift"
+            )
+        ]]
+    )
+    await message.answer(
         f"⏱ <b>Смена в процессе:</b> <b>{shift['project']}</b>\n"
+        f"🕒 Старт: {shift['start_time'].strftime('%H:%M')}\n"
         f"⏳ Прошло: <b>{hours} ч. {minutes} мин.</b>",
         reply_markup=kb,
         parse_mode="HTML",
     )
+
+
+@dp.callback_query(F.data == "shift_mode_now")
+async def cb_shift_mode_now(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
+  await state.update_data(is_retro=False)
+  kb = await render_project_keyboard("startshift", show_all=False)
+  await callback.message.edit_text(
+      "Выберите проект для старта:", reply_markup=kb, parse_mode="HTML"
+  )
+
+
+@dp.callback_query(F.data == "shift_mode_retro")
+async def cb_shift_mode_retro(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
+  await state.update_data(is_retro=True)
+  kb = await render_project_keyboard("startshift", show_all=False)
+  await callback.message.edit_text(
+      "Выберите проект для смены задним числом:",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
 
 
 @dp.callback_query(F.data == "startshift_showall")
@@ -764,25 +954,158 @@ async def cb_startshift_showall(callback: types.CallbackQuery):
 @dp.callback_query(
     F.data.startswith("startshift_") & (F.data != "startshift_showall")
 )
-async def cb_start_shift(callback: types.CallbackQuery):
+async def cb_choose_project_shift(
+    callback: types.CallbackQuery, state: FSMContext
+):
   await callback.answer()
-  user_id = callback.from_user.id
   proj_prefix = callback.data.replace("startshift_", "")
   projects = await asyncio.to_thread(get_filtered_projects_sync, True)
   full_project = next(
       (p for p in projects if p.startswith(proj_prefix)), "Склад / Общее"
   )
 
-  active_shifts[user_id] = {
-      "project": full_project,
-      "start_time": datetime.now(),
-      "claimed_meals": 0,
+  data = await state.get_data()
+  is_retro = data.get("is_retro", False)
+  emp_name = await get_or_register_employee(callback.from_user)
+
+  if not is_retro:
+    active_shifts[callback.from_user.id] = {
+        "project": full_project,
+        "start_time": get_now_astana(),
+        "employee": emp_name,
+        "claimed_meals": 0,
+    }
+    await callback.message.edit_text(
+        f"🟢 <b>Смена начата!</b>\n🎯 Проект: <b>{full_project}</b>\n🕒 Время"
+        f" старта: {get_now_astana().strftime('%H:%M')}",
+        parse_mode="HTML",
+    )
+  else:
+    await state.update_data(project=full_project)
+    await state.set_state(RetroShiftState.waiting_for_time)
+    await callback.message.edit_text(
+        f"🎯 Проект: <b>{full_project}</b>\n\n"
+        "🕒 <b>Во сколько фактически началась ваша смена?</b>\n"
+        "Напишите время в формате <code>14:00</code> или <code>2 часа"
+        " назад</code>:",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(RetroShiftState.waiting_for_time, F.text)
+async def process_retro_shift_time(message: types.Message, state: FSMContext):
+  time_text = message.text.strip()
+  data = await state.get_data()
+  project = data.get("project", "Склад / Общее")
+  await state.clear()
+
+  now = get_now_astana()
+  target_dt = now
+
+  match_hhmm = re.search(r"\b(\d{1,2})[:.](\d{2})\b", time_text)
+  if match_hhmm:
+    h, m = int(match_hhmm.group(1)), int(match_hhmm.group(2))
+    target_dt = now.replace(hour=h, minute=m, second=0)
+    if target_dt > now:
+      target_dt -= timedelta(days=1)
+  elif "час" in time_text:
+    digits = re.findall(r"\d+", time_text)
+    sub_h = int(digits[0]) if digits else 2
+    target_dt = now - timedelta(hours=sub_h)
+
+  req_id = f"SHIFT-{random.randint(1000, 9999)}"
+  employee = await get_or_register_employee(message.from_user)
+
+  pending_shift_requests[req_id] = {
+      "user_id": message.from_user.id,
+      "project": project,
+      "start_time": target_dt,
+      "employee": employee,
   }
-  await callback.message.edit_text(
-      f"🟢 <b>Смена начата!</b>\n🎯 Проект: <b>{full_project}</b>\n🕒 Время:"
-      f" {datetime.now().strftime('%H:%M')}",
+
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[[
+          InlineKeyboardButton(
+              text="✅ Подтвердить старт", callback_data=f"apprshift_{req_id}"
+          ),
+          InlineKeyboardButton(
+              text="❌ Отклонить", callback_data=f"rejshift_{req_id}"
+          ),
+      ]]
+  )
+
+  approvers = authenticated_admins | authenticated_managers
+  for approver_id in approvers:
+    try:
+      await bot.send_message(
+          approver_id,
+          f"⚠️ <b>Запрос на смену задним числом!</b>\n\n"
+          f"👤 Сотрудник: <b>{employee}</b>\n"
+          f"🎯 Проект: {project}\n"
+          f"🕒 Указал старт: <b>{target_dt.strftime('%H:%M (%d.%m)')}</b>\n\n"
+          "Подтвердить начало смены?",
+          reply_markup=kb,
+          parse_mode="HTML",
+      )
+    except Exception:
+      pass
+
+  await message.answer(
+      "⏳ <b>Запрос отправлен управляющему на согласование.</b>\n"
+      f"После подтверждения ваша смена запустится с {target_dt.strftime('%H:%M')}.",
       parse_mode="HTML",
   )
+
+
+@dp.callback_query(F.data.startswith("apprshift_"))
+async def cb_appr_shift(callback: types.CallbackQuery):
+  await callback.answer()
+  req_id = callback.data.replace("apprshift_", "")
+  shift_info = pending_shift_requests.pop(req_id, None)
+  if not shift_info:
+    await callback.message.edit_text("Смена уже была обработана.")
+    return
+
+  u_id = shift_info["user_id"]
+  active_shifts[u_id] = {
+      "project": shift_info["project"],
+      "start_time": shift_info["start_time"],
+      "employee": shift_info["employee"],
+      "claimed_meals": 0,
+  }
+
+  await callback.message.edit_text(
+      f"✅ Смена сотрудника <b>{shift_info['employee']}</b> подтверждена с"
+      f" {shift_info['start_time'].strftime('%H:%M')}!",
+      parse_mode="HTML",
+  )
+  try:
+    await bot.send_message(
+        u_id,
+        f"✅ <b>Управляющий подтвердил вашу смену!</b>\n🎯"
+        f" {shift_info['project']}\n🕒 Старт зафиксирован:"
+        f" {shift_info['start_time'].strftime('%H:%M')}",
+        parse_mode="HTML",
+    )
+  except Exception:
+    pass
+
+
+@dp.callback_query(F.data.startswith("rejshift_"))
+async def cb_rej_shift(callback: types.CallbackQuery):
+  await callback.answer()
+  req_id = callback.data.replace("rejshift_", "")
+  shift_info = pending_shift_requests.pop(req_id, None)
+  if shift_info:
+    try:
+      await bot.send_message(
+          shift_info["user_id"],
+          "❌ <b>Запрос на смену задним числом отклонен.</b>",
+          parse_mode="HTML",
+      )
+    except Exception:
+      pass
+  await callback.message.edit_text("❌ Запрос на смену отклонен.")
 
 
 @dp.callback_query(F.data == "end_shift")
@@ -792,9 +1115,9 @@ async def cb_end_shift(callback: types.CallbackQuery):
     await callback.answer("Смена не найдена", show_alert=True)
     return
 
-  await callback.answer("Завершаю смену...")
+  await callback.answer("Завершаю...")
   shift = active_shifts.pop(user_id)
-  duration = datetime.now() - shift["start_time"]
+  duration = get_now_astana() - shift["start_time"]
   hours = duration.total_seconds() / 3600
 
   earned_meals_count = int(hours // 6)
@@ -819,790 +1142,17 @@ async def cb_end_shift(callback: types.CallbackQuery):
   )
 
 
-# --- ПАНЕЛЬ ADMIN ---
+# --- РАСХОДЫ И ЧЕКИ ---
 
 
-@dp.message(F.text == "💼 Панель выплат (Admin)")
-@dp.message(Command("admin"))
-async def admin_panel_handler(message: types.Message):
-  if message.from_user.id not in ADMIN_IDS:
-    await message.answer("⛔️ Нет прав доступа.")
-    return
-  await render_admin_menu(message)
-
-
-async def render_admin_menu(event_target):
-  debts = await asyncio.to_thread(get_debts_summary_sync)
-  total_debt = sum(debts.values()) if debts else 0
-
-  text = (
-      "💼 <b>Панель управления (Admin)</b>\n\n"
-      f"💵 <b>Текущий долг перед командой:</b> {total_debt:,.0f} ₸\n\n"
-      "Выберите действие:"
-  )
-
-  buttons = [
-      [
-          InlineKeyboardButton(
-              text="➕ Создать проект (Голос/Текст)",
-              callback_data="admin_create_project",
-          ),
-          InlineKeyboardButton(
-              text="⚡️ Быстрый расход",
-              callback_data="admin_fast_expense",
-          ),
-      ],
-      [
-          InlineKeyboardButton(
-              text="🏁 Завершить проект",
-              callback_data="admin_close_project",
-          ),
-          InlineKeyboardButton(
-              text=f"💸 Выплаты ({len(debts)})",
-              callback_data="admin_payouts_list",
-          ),
-      ],
-      [
-          InlineKeyboardButton(
-              text="🛠 Починить формулы в таблице",
-              callback_data="admin_repair_tables",
-          )
-      ],
-      [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_hub")],
-  ]
-
-  kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-  if isinstance(event_target, types.Message):
-    await event_target.answer(text, reply_markup=kb, parse_mode="HTML")
-  else:
-    await event_target.message.edit_text(
-        text, reply_markup=kb, parse_mode="HTML"
-    )
-
-
-@dp.callback_query(F.data == "admin_repair_tables")
-async def cb_admin_repair_tables(callback: types.CallbackQuery):
-  await callback.answer("Исправляю формулы...")
-  ok = await asyncio.to_thread(repair_spreadsheet_sync)
-  if ok:
-    await callback.message.answer("✅ Таблица успешно восстановлена!")
-  else:
-    await callback.message.answer("⚠️ Не удалось исправить таблицу.")
-  await render_admin_menu(callback)
-
-
-@dp.callback_query(F.data == "admin_hub")
-async def cb_admin_hub(callback: types.CallbackQuery, state: FSMContext):
-  await callback.answer()
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  await state.clear()
-  await render_admin_menu(callback)
-
-
-# --- ЗАВЕРШЕНИЕ ПРОЕКТА В АДМИНКЕ ---
-
-
-@dp.callback_query(F.data == "admin_close_project")
-async def cb_admin_close_project_list(callback: types.CallbackQuery):
-  await callback.answer()
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-
-  projects = await asyncio.to_thread(get_filtered_projects_sync, True)
-  active_projs = [p for p in projects if p != "Склад / Общее"]
-
-  if not active_projs:
-    await callback.message.edit_text(
-        "🏁 <b>Все проекты уже завершены!</b>\n\nНет активных мероприятий для"
-        " закрытия.",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")
-            ]]
-        ),
-        parse_mode="HTML",
-    )
-    return
-
-  kb = [
-      [
-          InlineKeyboardButton(
-              text=f"🏁 {p}", callback_data=f"closeproj_{p[:25]}"
-          )
-      ]
-      for p in active_projs
-  ]
-  kb.append(
-      [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_hub")]
-  )
-
-  await callback.message.edit_text(
-      "🏁 <b>Завершение проекта</b>\n\n"
-      "Выберите проект, который нужно перевести в статус <b>«Завершен»</b>:\n"
-      "<i>(Он перестанет всплывать в меню выбора у всей команды)</i>",
-      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+@dp.message(F.text == "🧾 Расходы")
+async def cmd_expenses_info(message: types.Message):
+  await message.answer(
+      "🧾 <b>Отправка чеков и накладных</b>\n\n"
+      "Просто пришлите фото чека в этот чат. Бот распознает сумму, сохранит его"
+      " на диск для просмотра с телефона и внесет в смету проекта.",
       parse_mode="HTML",
   )
-
-
-@dp.callback_query(F.data.startswith("closeproj_"))
-async def cb_confirm_close_project(callback: types.CallbackQuery):
-  await callback.answer("Завершаю проект...")
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-
-  proj_prefix = callback.data.replace("closeproj_", "")
-  closed_name = await asyncio.to_thread(
-      set_project_status_sync, proj_prefix, "Завершен"
-  )
-
-  if closed_name:
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="⬅️ В панель управления", callback_data="admin_hub"
-            )
-        ]]
-    )
-    await callback.message.edit_text(
-        "✅ <b>Проект успешно завершен!</b>\n\n"
-        f"🎯 <b>{closed_name}</b>\n"
-        "📊 Статус в таблице изменен на <b>«Завершен»</b>.\n"
-        "Проект скрыт из списков выбора команды.",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-  else:
-    await callback.answer(
-        "⚠️ Не удалось найти проект в таблице.", show_alert=True
-    )
-    await render_admin_menu(callback)
-
-
-# --- СОКРАЩЕННЫЙ РАСХОД: В 2 ШАГА ---
-
-
-@dp.callback_query(F.data == "admin_fast_expense")
-async def cb_fast_expense_start(
-    callback: types.CallbackQuery, state: FSMContext
-):
-  await callback.answer()
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-
-  await state.clear()
-  kb = await render_project_keyboard("fastexp", show_all=False)
-  await callback.message.edit_text(
-      "⚡️ <b>Быстрый расход (Шаг 1 из 2)</b>\n\n"
-      "Выберите проект, к которому относится расход:",
-      reply_markup=kb,
-      parse_mode="HTML",
-  )
-
-
-@dp.callback_query(F.data == "fastexp_showall")
-async def cb_fastexp_showall(callback: types.CallbackQuery):
-  await callback.answer()
-  kb = await render_project_keyboard("fastexp", show_all=True)
-  await callback.message.edit_reply_markup(reply_markup=kb)
-
-
-@dp.callback_query(
-    F.data.startswith("fastexp_") & (F.data != "fastexp_showall")
-)
-async def cb_fast_expense_choose_proj(
-    callback: types.CallbackQuery, state: FSMContext
-):
-  await callback.answer()
-  proj_short = callback.data.replace("fastexp_", "")
-  projects = await asyncio.to_thread(get_filtered_projects_sync, True)
-  full_project = next(
-      (p for p in projects if p.startswith(proj_short)), "Склад / Общее"
-  )
-
-  await state.update_data(project=full_project)
-  await state.set_state(QuickExpenseState.waiting_for_details)
-
-  await callback.message.edit_text(
-      f"🎯 Проект: <b>{full_project}</b>\n\n"
-      "<b>Шаг 2 из 2:</b> Напишите в чат сумму и суть одной строчкой.\n\n"
-      "<i>Примеры:\n"
-      "• <code>75000 субаренда микрофонов</code> (спишет с кассы/ИП)\n"
-      "• <code>25000 газель доставка лично</code> (поставит к возмещению"
-      " вам)</i>",
-      parse_mode="HTML",
-  )
-
-
-@dp.message(QuickExpenseState.waiting_for_details, F.text)
-async def process_fast_expense_details(
-    message: types.Message, state: FSMContext
-):
-  text_input = message.text.strip()
-  data = await state.get_data()
-  project = data.get("project", "Склад / Общее")
-  await state.clear()
-
-  status_msg = await message.answer("🤖 Разбираю расход через Gemini...")
-
-  prompt = f"""
-    Пользователь ввел расход по мероприятию: "{text_input}"
-    Извлеки:
-    - "amount": число (сумма расхода)
-    - "category": одна из категорий ("Субаренда оборудования", "Гонорары наемным техникам", "Такси / Логистика / ГСМ", "Расходники (тейп, батарейки)", "Склад / Ремонт оборудования", "Питание команды", "Прочее")
-    - "description": краткое описание покупки
-    - "is_personal": true, если написано "лично", "из своих", "мне", иначе false (тогда касса ИП)
-    Ответь ТОЛЬКО валидным JSON.
-    """
-
-  try:
-    resp_text = await call_gemini_safe(prompt, json_mode=True)
-    if not resp_text:
-      await status_msg.edit_text(
-          "⚠️ Серверы временно перегружены. Попробуйте еще раз через секунду."
-      )
-      return
-
-    raw = resp_text.strip()
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
-    exp_data = json.loads(raw[start:end])
-
-    amount = float(exp_data.get("amount", 0))
-    category = exp_data.get("category", "Прочее")
-    desc = exp_data.get("description", text_input)
-    is_personal = exp_data.get("is_personal", False)
-
-    payer_name = (
-        await get_or_register_employee(message.from_user)
-        if is_personal
-        else "Касса / ИП"
-    )
-    status_str = "К возмещению" if is_personal else "Не требуется"
-
-    await asyncio.to_thread(
-        log_expense_sync,
-        project,
-        category,
-        amount,
-        message.from_user,
-        desc,
-        "Вручную (быстрый ввод)",
-        payer_name,
-        status_str,
-    )
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="⬅️ В панель управления", callback_data="admin_hub"
-            )
-        ]]
-    )
-    await status_msg.edit_text(
-        f"✅ <b>Расход внесен в 1 шаг!</b>\n\n"
-        f"🎯 Проект: <b>{project}</b>\n"
-        f"💵 Сумма: <b>{amount:,.0f} ₸</b>\n"
-        f"📂 Категория: {category}\n"
-        f"💳 Оплата: {payer_name} ({status_str})\n"
-        f"📝 Детали: <i>{desc}</i>",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-  except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка разбора: {e}")
-
-
-# --- УНИВЕРСАЛЬНОЕ СОЗДАНИЕ ПРОЕКТА (ЯНДЕКС STT + GEMINI) ---
-
-
-@dp.callback_query(F.data == "admin_create_project")
-async def cb_start_project_creation(
-    callback: types.CallbackQuery, state: FSMContext
-):
-  await callback.answer()
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-
-  await state.set_state(ProjectCreationState.waiting_for_input)
-  await callback.message.edit_text(
-      "➕ <b>Создание нового мероприятия</b>\n\n"
-      "🎙 <b>Надиктуйте голосовое</b> (распознает Яндекс) ИЛИ ✍️ <b>напишите"
-      " текстом:</b>\n\n"
-      "<i>Пример текста:\n«25.09 Концерт Баста, Дворец Спорта, смета 1.5 млн,"
-      " предоплата 50%»</i>\n\n"
-      "Жду аудио или текст...",
-      parse_mode="HTML",
-  )
-
-
-async def render_project_card(target, data: dict):
-  transcript = data.get("transcript", "")
-  event_date = data.get("event_date", "-")
-  proj_name = data.get("project_name", "-")
-  location = data.get("location", "-")
-  price = float(data.get("price", 0))
-  prepay_pct = int(data.get("prepay_percent", 0))
-  paid_preview = price * (prepay_pct / 100.0)
-
-  transcript_block = f"🗣 <i>«{transcript}»</i>\n\n" if transcript else ""
-
-  text = (
-      "📋 <b>Проверьте данные проекта:</b>\n\n"
-      f"{transcript_block}"
-      f"📅 <b>Дата:</b> {event_date}\n"
-      f"🎯 <b>Название:</b> {proj_name}\n"
-      f"📍 <b>Площадка:</b> {location}\n"
-      f"💵 <b>Смета:</b> {price:,.0f} ₸\n"
-      f"💰 <b>Предоплата:</b> {prepay_pct}% ({paid_preview:,.0f} ₸)\n\n"
-      "Всё верно?"
-  )
-
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="✅ Все верно, создать!",
-                  callback_data="confirm_voice_proj",
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="🔄 Заново", callback_data="admin_create_project"
-              ),
-              InlineKeyboardButton(
-                  text="✏️ Исправить", callback_data="edit_voice_fields_menu"
-              ),
-          ],
-          [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_hub")],
-      ]
-  )
-
-  if isinstance(target, types.Message):
-    await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
-  else:
-    await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-
-async def parse_project_with_ai(
-    message: types.Message, state: FSMContext, input_data
-):
-  status_msg = await message.answer("🎧 Распознаю проект...")
-
-  prompt = """
-    Ты финансовый ассистент компании аренды сценического оборудования.
-    Извлеки данные о проекте и верни ТОЛЬКО валидный JSON:
-    {
-      "event_date": "дата ДД.ММ (если не названа, текущая)",
-      "project_name": "название события без даты (например: Концерт Баста)",
-      "location": "площадка / отель",
-      "price": общая сумма сметы числом,
-      "prepay_percent": 0, 50 или 100
-    }
-    """
-
-  recognized_text = ""
-
-  try:
-    if isinstance(input_data, bytes):
-      # Сначала пытаемся распознать через Яндекс SpeechKit
-      await status_msg.edit_text("🎧 Слушаю аудио через Яндекс SpeechKit...")
-      recognized_text = await recognize_speech_yandex(input_data)
-
-      if recognized_text:
-        # Успешно распознано Яндексом: отправляем текст на структурирование в Gemini
-        await status_msg.edit_text("🤖 Структурирую данные проекта...")
-        contents = [
-            f"Текст администратора: \"{recognized_text}\"",
-            prompt,
-        ]
-      else:
-        # Если Яндекс не ответил, используем прямой разбор аудио в Gemini как резерв
-        await status_msg.edit_text("🤖 Разбираю проект через резервный канал...")
-        contents = [
-            genai_types.Part.from_bytes(
-                data=input_data, mime_type="audio/ogg"
-            ),
-            prompt,
-        ]
-    else:
-      recognized_text = input_data
-      contents = [
-          f"Текст администратора: \"{recognized_text}\"",
-          prompt,
-      ]
-
-    resp_text = await call_gemini_safe(contents, json_mode=True)
-    if not resp_text:
-      await status_msg.edit_text(
-          "⚠️ Не удалось разобрать проект. Попробуйте еще раз."
-      )
-      return
-
-    raw = resp_text.strip()
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
-    data = json.loads(raw[start:end])
-
-    await state.set_state(ProjectCreationState.waiting_for_input)
-    await state.update_data(
-        transcript=recognized_text,
-        event_date=data.get("event_date", datetime.now().strftime("%d.%m")),
-        project_name=data.get("project_name", "Мероприятие"),
-        location=data.get("location", "Не указана"),
-        price=float(data.get("price", 0)),
-        prepay_percent=int(data.get("prepay_percent", 0)),
-    )
-    await render_project_card(status_msg, await state.get_data())
-
-  except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка разбора: {e}")
-
-
-# Прием голоса для проекта
-@dp.message(ProjectCreationState.waiting_for_input, F.voice | F.audio)
-@dp.message(F.from_user.id.in_(ADMIN_IDS), F.voice | F.audio)
-async def process_project_voice(message: types.Message, state: FSMContext):
-  voice_obj = message.voice or message.audio
-  file_io = io.BytesIO()
-  await bot.download(voice_obj, destination=file_io)
-  await parse_project_with_ai(message, state, file_io.getvalue())
-
-
-# Прием текста для проекта
-@dp.message(ProjectCreationState.waiting_for_input, F.text)
-async def process_project_text(message: types.Message, state: FSMContext):
-  await parse_project_with_ai(message, state, message.text.strip())
-
-
-@dp.callback_query(F.data == "edit_voice_fields_menu")
-async def cb_edit_fields_menu(callback: types.CallbackQuery):
-  await callback.answer()
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text="📅 Дату", callback_data="field_event_date"
-              ),
-              InlineKeyboardButton(
-                  text="🎯 Название", callback_data="field_project_name"
-              ),
-          ],
-          [
-              InlineKeyboardButton(
-                  text="📍 Локацию", callback_data="field_location"
-              ),
-              InlineKeyboardButton(
-                  text="💵 Смету", callback_data="field_price"
-              ),
-          ],
-          [
-              InlineKeyboardButton(
-                  text="💰 Предоплату (%)", callback_data="field_prepay_percent"
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="⬅️ Назад", callback_data="back_to_card"
-              )
-          ],
-      ]
-  )
-  await callback.message.edit_text(
-      "✏️ <b>Выберите поле для исправления:</b>",
-      reply_markup=kb,
-      parse_mode="HTML",
-  )
-
-
-@dp.callback_query(F.data.startswith("field_"))
-async def cb_select_field_to_edit(
-    callback: types.CallbackQuery, state: FSMContext
-):
-  await callback.answer()
-  field_name = callback.data.replace("field_", "")
-  await state.update_data(editing_target=field_name)
-  await state.set_state(ProjectCreationState.editing_field)
-
-  prompts = {
-      "event_date": "Введите правильную <b>дату</b> (25.09):",
-      "project_name": "Введите правильное <b>название</b>:",
-      "location": "Введите <b>площадку</b>:",
-      "price": "Введите <b>смету числом</b> (1500000):",
-      "prepay_percent": "Введите <b>процент предоплаты (0, 50 или 100)</b>:",
-  }
-  await callback.message.edit_text(
-      prompts.get(field_name, "Введите значение:"), parse_mode="HTML"
-  )
-
-
-@dp.message(ProjectCreationState.editing_field, F.text)
-async def process_field_edit_text(message: types.Message, state: FSMContext):
-  data = await state.get_data()
-  field = data.get("editing_target")
-  text_val = message.text.strip()
-
-  if field == "price":
-    try:
-      val = float(text_val.replace(" ", "").replace(",", "."))
-      await state.update_data(price=val)
-    except ValueError:
-      await message.answer("⚠️ Введите число:")
-      return
-  elif field == "prepay_percent":
-    try:
-      val = int(text_val.replace("%", "").strip())
-      await state.update_data(prepay_percent=val)
-    except ValueError:
-      await message.answer("⚠️ Введите 0, 50 или 100:")
-      return
-  elif field in ["event_date", "project_name", "location"]:
-    await state.update_data({field: text_val})
-
-  await state.set_state(ProjectCreationState.waiting_for_input)
-  updated_data = await state.get_data()
-  msg_wait = await message.answer("🔄 Обновляю...")
-  await render_project_card(msg_wait, updated_data)
-
-
-@dp.callback_query(F.data == "back_to_card")
-async def cb_back_to_card(callback: types.CallbackQuery, state: FSMContext):
-  await callback.answer()
-  data = await state.get_data()
-  await render_project_card(callback, data)
-
-
-def add_project_to_sheets_sync(data: dict):
-  ws_proj = spreadsheet.worksheet("Проекты")
-  next_row = len(ws_proj.col_values(1)) + 1
-
-  event_date = data.get("event_date", "").strip()
-  raw_name = data.get("project_name", "").strip()
-
-  if event_date and not raw_name.startswith(event_date):
-    full_proj_name = f"{event_date} {raw_name}"
-  else:
-    full_proj_name = raw_name
-
-  total_price = float(data.get("price", 0))
-  prepay_pct = int(data.get("prepay_percent", 0))
-  paid_amount = total_price * (prepay_pct / 100.0)
-
-  formula_expenses = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
-  formula_profit = f"=D{next_row}-E{next_row}"
-  formula_margin = f"=IF(D{next_row}>0; F{next_row}/D{next_row}; 0)"
-
-  ws_proj.append_row(
-      [
-          full_proj_name,
-          data.get("location", "Площадка"),
-          "В работе",
-          total_price,
-          formula_expenses,
-          formula_profit,
-          formula_margin,
-      ],
-      value_input_option="USER_ENTERED",
-  )
-
-  if paid_amount > 0:
-    ws_ops = spreadsheet.worksheet("Операции")
-    tx_id = f"TX-{random.randint(10000, 99999)}"
-    now_str = datetime.now().strftime("%d.%m.%Y %H:%M")
-    ws_ops.append_row(
-        [
-            tx_id,
-            now_str,
-            "Доход",
-            full_proj_name,
-            "Комплексный продакшн",
-            paid_amount,
-            "Клиент",
-            "Не требуется",
-            "-",
-            f"Предоплата ({prepay_pct}%)",
-        ],
-        value_input_option="USER_ENTERED",
-    )
-
-  return full_proj_name, total_price, paid_amount
-
-
-@dp.callback_query(F.data == "confirm_voice_proj")
-async def cb_confirm_voice_proj(
-    callback: types.CallbackQuery, state: FSMContext
-):
-  await callback.answer()
-  data = await state.get_data()
-  if not data or "project_name" not in data:
-    await callback.answer("Данные устарели", show_alert=True)
-    return
-
-  await callback.message.edit_text("⏳ Записываю проект в Google Таблицу...")
-
-  try:
-    full_proj_name, total_price, paid_amount = await asyncio.to_thread(
-        add_project_to_sheets_sync, data
-    )
-    await state.clear()
-
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[
-            InlineKeyboardButton(
-                text="⬅️ В панель управления", callback_data="admin_hub"
-            )
-        ]]
-    )
-
-    await callback.message.edit_text(
-        f"✅ <b>Мероприятие создано!</b>\n\n"
-        f"🎯 <b>{full_proj_name}</b>\n"
-        f"📍 Площадка: {data.get('location', 'Площадка')}\n"
-        f"💵 Смета: {total_price:,.0f} ₸\n"
-        f"💰 Предоплата: {paid_amount:,.0f} ₸",
-        reply_markup=kb,
-        parse_mode="HTML",
-    )
-  except Exception as e:
-    await callback.message.edit_text(f"⚠️ Ошибка записи: {e}")
-
-
-# --- ВЫПЛАТЫ КОМАНДЕ ---
-
-
-@dp.callback_query(F.data == "admin_payouts_list")
-async def cb_admin_payouts_list(callback: types.CallbackQuery):
-  await callback.answer()
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-
-  debts = await asyncio.to_thread(get_debts_summary_sync)
-  buttons = []
-
-  if not debts:
-    text = "💼 <b>Выплаты команде</b>\n\n🎉 Все долги закрыты!"
-  else:
-    total_debt = sum(debts.values())
-    text = f"💼 <b>Выплаты команде</b>\n\n💵 Долг: {total_debt:,.0f} ₸\n\n"
-    for person, sum_amt in debts.items():
-      text += f"• <b>{person}</b>: {sum_amt:,.0f} ₸\n"
-      buttons.append([
-          InlineKeyboardButton(
-              text=f"💸 Погасить: {person} ({sum_amt:,.0f} ₸)",
-              callback_data=f"pay_{person[:25]}",
-          )
-      ])
-
-  buttons.append(
-      [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")]
-  )
-  kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-  await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-
-
-@dp.callback_query(F.data.startswith("pay_"))
-async def cb_pay_person_preview(callback: types.CallbackQuery):
-  await callback.answer()
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-
-  person_prefix = callback.data.replace("pay_", "")
-  debts = await asyncio.to_thread(get_debts_summary_sync)
-
-  full_person_name = next(
-      (p for p in debts if p.startswith(person_prefix)), person_prefix
-  )
-  amount = debts.get(full_person_name, 0.0)
-  reqs = await asyncio.to_thread(get_employee_requisites_sync, full_person_name)
-
-  kb = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(
-                  text=f"✅ Переведено {amount:,.0f} ₸ (Списать долг)",
-                  callback_data=f"confirmpay_{person_prefix[:20]}",
-              )
-          ],
-          [
-              InlineKeyboardButton(
-                  text="⬅️ Назад", callback_data="admin_payouts_list"
-              )
-          ],
-      ]
-  )
-
-  await callback.message.edit_text(
-      f"💼 <b>Выплата:</b> {full_person_name}\n"
-      f"💵 <b>Сумма:</b> <code>{amount:,.0f}</code> ₸\n\n"
-      f"📋 <b>Реквизиты:</b>\n<code>{reqs}</code>",
-      reply_markup=kb,
-      parse_mode="HTML",
-  )
-
-
-def close_debt_sync(person_prefix: str):
-  ws = spreadsheet.worksheet("Операции")
-  all_values = ws.get_all_values()
-  if not all_values:
-    return
-
-  headers = [str(h).strip().lower() for h in all_values[0]]
-  status_col_idx = 8
-  who_col_idx = 7
-
-  for idx, h in enumerate(headers, start=1):
-    if "статус" in h:
-      status_col_idx = idx
-    elif "кто" in h or "сотрудник" in h:
-      who_col_idx = idx
-
-  for row_idx, row in enumerate(all_values[1:], start=2):
-    if len(row) >= max(status_col_idx, who_col_idx):
-      who_val = row[who_col_idx - 1].strip()
-      status_val = row[status_col_idx - 1].strip().lower()
-
-      if (
-          person_prefix.lower() in who_val.lower()
-          or who_val.lower() in person_prefix.lower()
-      ) and "к возмещению" in status_val:
-        ws.update_cell(row_idx, status_col_idx, "Выплачено")
-
-
-@dp.callback_query(F.data.startswith("confirmpay_"))
-async def cb_confirm_payment(callback: types.CallbackQuery):
-  if callback.from_user.id not in ADMIN_IDS:
-    return
-  await callback.answer("Списываю долг...")
-  person_prefix = callback.data.replace("confirmpay_", "")
-  await asyncio.to_thread(close_debt_sync, person_prefix)
-  await render_admin_menu(callback)
-
-
-# --- ПЕРЕХВАТ ТЕКСТА РЕКВИЗИТОВ ---
-
-
-@dp.message(
-    StateFilter(None),
-    F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS),
-)
-async def handle_user_text_input(message: types.Message):
-  user_id = message.from_user.id
-  if user_id in waiting_for_requisites:
-    del waiting_for_requisites[user_id]
-    employee = await get_or_register_employee(message.from_user)
-    await asyncio.to_thread(
-        save_employee_requisites_sync, employee, message.text.strip()
-    )
-    await message.answer(
-        f"✅ <b>Реквизиты сохранены!</b>\n\n👤 {employee}\n📋"
-        f" <code>{message.text.strip()}</code>",
-        reply_markup=get_main_keyboard(user_id),
-        parse_mode="HTML",
-    )
-
-
-# --- РАСПОЗНАВАНИЕ ЧЕКОВ (ФОТО) ---
 
 
 @dp.message(F.photo)
@@ -1612,9 +1162,16 @@ async def handle_photo(message: types.Message):
     await message.answer("⚠️ Этот чек уже был успешно внесен ранее!")
     return
 
-  status_msg = await message.answer("🔍 Распознаю чек...")
+  status_msg = await message.answer("🔍 Распознаю чек (Gemini 3.6)...")
   file_io = io.BytesIO()
   await bot.download(photo, destination=file_io)
+  image_bytes = file_io.getvalue()
+
+  drive_link = await asyncio.to_thread(
+      upload_receipt_to_drive_sync,
+      image_bytes,
+      f"receipt_{message.from_user.id}_{datetime.now().strftime('%d%m_%H%M%S')}.jpg",
+  )
 
   prompt = """
     Ты финансовый сканер сценического оборудования.
@@ -1631,17 +1188,15 @@ async def handle_photo(message: types.Message):
     resp_text = await call_gemini_safe(
         [
             genai_types.Part.from_bytes(
-                data=file_io.getvalue(), mime_type="image/jpeg"
+                data=image_bytes, mime_type="image/jpeg"
             ),
             prompt,
         ],
         json_mode=True,
     )
-
     if not resp_text:
       await status_msg.edit_text(
-          "⚠️ Серверы временно перегружены. Пожалуйста, отправьте чек еще раз"
-          " через секунду."
+          "⚠️ Серверы временно перегружены. Попробуйте отправить чек еще раз."
       )
       return
 
@@ -1649,76 +1204,42 @@ async def handle_photo(message: types.Message):
     start = raw.find("{")
     end = raw.rfind("}") + 1
     data = json.loads(raw[start:end])
-    amount = data.get("amount", 0)
+    amount = float(data.get("amount", 0))
     merchant = data.get("merchant", "Неизвестно")
-
+    category = data.get("category", "Прочее")
     employee = await get_or_register_employee(message.from_user)
+
     pending_receipts[message.from_user.id] = {
         "amount": amount,
         "merchant": merchant,
-        "category": data.get("category", "Прочее"),
+        "category": category,
         "description": data.get("description", ""),
         "user_name": employee,
+        "drive_link": drive_link,
         "file_unique_id": photo.file_unique_id,
     }
 
-    duplicate = await asyncio.to_thread(
-        check_for_duplicate_receipt_sync, employee, float(amount), merchant
+    now = get_now_astana()
+    is_night = now.hour >= 22 or now.hour < 7
+    extra_note = ""
+    if "такси" in category.lower() or "яндекс" in merchant.lower():
+      extra_note = (
+          "\n\n🌙 <i>Ночное такси (22:00–07:00) зачислится сразу!</i>"
+          if is_night
+          else "\n\n☀️ <i>Дневное такси потребует согласования.</i>"
+      )
+
+    kb = await render_project_keyboard("proj", show_all=False)
+    await status_msg.edit_text(
+        f"🧾 <b>Чек:</b> {amount:,.0f} ₸ ({merchant})\n"
+        f"📂 {category} — {data.get('description', '')}\n"
+        f"👤 {employee}{extra_note}\n\n"
+        "👉 <b>К какому проекту привязать чек?</b>",
+        reply_markup=kb,
+        parse_mode="HTML",
     )
-    if duplicate:
-      kb_dup = InlineKeyboardMarkup(
-          inline_keyboard=[
-              [
-                  InlineKeyboardButton(
-                      text="➕ Да, это отдельный чек",
-                      callback_data="confirm_duplicate_ok",
-                  )
-              ],
-              [
-                  InlineKeyboardButton(
-                      text="❌ Отмена (дубль)", callback_data="cancel_duplicate"
-                  )
-              ],
-          ]
-      )
-      await status_msg.edit_text(
-          f"⚠️ <b>Похожий чек уже был сегодня!</b>\n💵"
-          f" {duplicate['amount']:,.0f} ₸ ({merchant})\nЭто отдельная покупка?",
-          reply_markup=kb_dup,
-          parse_mode="HTML",
-      )
-      return
-
-    await show_project_selection(status_msg, amount, merchant, data, employee)
   except Exception as e:
-    await status_msg.edit_text(f"⚠️ Ошибка разбора чека: {e}")
-
-
-@dp.callback_query(F.data == "confirm_duplicate_ok")
-async def cb_confirm_duplicate(callback: types.CallbackQuery):
-  await callback.answer()
-  user_id = callback.from_user.id
-  receipt = pending_receipts.get(user_id)
-  if not receipt:
-    await callback.answer("Данные устарели", show_alert=True)
-    return
-
-  await show_project_selection(
-      callback,
-      receipt["amount"],
-      receipt["merchant"],
-      receipt,
-      receipt["user_name"],
-  )
-
-
-@dp.callback_query(F.data == "cancel_duplicate")
-async def cb_cancel_duplicate(callback: types.CallbackQuery):
-  await callback.answer()
-  user_id = callback.from_user.id
-  if user_id in pending_receipts:
-    del pending_receipts[user_id]
-  await callback.message.edit_text("❌ Загрузка отменена.")
+    await status_msg.edit_text(f"⚠️ Ошибка разбора: {e}")
 
 
 @dp.callback_query(F.data == "proj_showall")
@@ -1730,13 +1251,12 @@ async def cb_proj_showall(callback: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("proj_") & (F.data != "proj_showall"))
 async def process_project_choice(callback: types.CallbackQuery):
-  await callback.answer("Записываю чек...")
+  await callback.answer("Записываю...")
   project_short = callback.data.replace("proj_", "")
   user_id = callback.from_user.id
   receipt = pending_receipts.get(user_id)
-
   if not receipt:
-    await callback.answer("Данные устарели.", show_alert=True)
+    await callback.answer("Данные чека устарели.", show_alert=True)
     return
 
   projects = await asyncio.to_thread(get_filtered_projects_sync, True)
@@ -1744,40 +1264,849 @@ async def process_project_choice(callback: types.CallbackQuery):
       (p for p in projects if p.startswith(project_short)), "Склад / Общее"
   )
 
-  await callback.message.edit_reply_markup(reply_markup=None)
-  status_update = await callback.message.answer("⏳ Записываю в таблицу...")
+  now = get_now_astana()
+  category = receipt["category"]
+  is_taxi = (
+      "такси" in category.lower() or "яндекс" in receipt["merchant"].lower()
+  )
 
+  # Дневное такси -> на согласование
+  if is_taxi and not (now.hour >= 22 or now.hour < 7):
+    tx_id = f"TX-{random.randint(10000, 99999)}"
+    await asyncio.to_thread(
+        log_expense_sync,
+        full_project,
+        category,
+        float(receipt["amount"]),
+        callback.from_user,
+        f"{receipt['merchant']}: {receipt['description']} (Дневное такси)",
+        "Чек такси",
+        status="На согласовании",
+        drive_link=receipt.get("drive_link"),
+        tx_id=tx_id,
+    )
+    kb_appr = InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="✅ Одобрить", callback_data=f"apprtaxi_{tx_id}"
+            ),
+            InlineKeyboardButton(
+                text="❌ Отклонить", callback_data=f"rejtaxi_{tx_id}"
+            ),
+        ]]
+    )
+    approvers = authenticated_admins | authenticated_managers
+    for a_id in approvers:
+      try:
+        await bot.send_message(
+            a_id,
+            f"🚕 <b>Запрос на дневное такси!</b>\n\n"
+            f"👤 Сотрудник: <b>{receipt['user_name']}</b>\n"
+            f"🎯 Проект: {full_project}\n"
+            f"💵 Сумма: {receipt['amount']:,.0f} ₸\n"
+            f"🕒 Время поездки: {now.strftime('%H:%M')}\n\nОдобрить выплату?",
+            reply_markup=kb_appr,
+            parse_mode="HTML",
+        )
+      except Exception:
+        pass
+
+    del pending_receipts[user_id]
+    await callback.message.edit_text(
+        f"⏳ <b>Дневное такси отправлено на согласование управляющему!</b>\n\n🎯"
+        f" {full_project}\n💵 {receipt['amount']:,.0f} ₸",
+        parse_mode="HTML",
+    )
+    return
+
+  # Ночное такси или обычный расход -> сразу к возмещению
   try:
     await asyncio.to_thread(
         log_expense_sync,
         full_project,
-        receipt["category"],
+        category,
         float(receipt["amount"]),
         callback.from_user,
         f"{receipt['merchant']}: {receipt['description']}",
         "Чек в Telegram",
+        status="К возмещению",
+        drive_link=receipt.get("drive_link"),
     )
-
     if receipt.get("file_unique_id"):
       saved_receipt_file_ids.add(receipt["file_unique_id"])
 
     del pending_receipts[user_id]
-    await status_update.edit_text(
-        f"✅ <b>Расход внесен в таблицу!</b>\n\n"
+    await callback.message.edit_text(
+        f"✅ <b>Расход сохранен в таблицу!</b>\n\n"
         f"🎯 Проект: {full_project}\n"
         f"💵 Сумма: {receipt['amount']:,.0f} ₸\n"
-        f"👤 Сотрудник: {receipt['user_name']}",
+        f"👤 Сотрудник: {receipt['user_name']}\n"
+        f"📎 Чек прикреплен ссылкой в Google Таблице.",
         parse_mode="HTML",
     )
   except Exception as e:
-    await status_update.edit_text(f"⚠️ Ошибка записи: {e}")
+    await callback.message.edit_text(f"⚠️ Ошибка записи: {e}")
 
 
-# --- ВЕБ-СЕРВЕР И ТОЧКА ВХОДА ---
+@dp.callback_query(F.data.startswith("apprtaxi_"))
+async def cb_appr_taxi(callback: types.CallbackQuery):
+  await callback.answer()
+  tx_id = callback.data.replace("apprtaxi_", "")
+  ok = await asyncio.to_thread(
+      update_expense_status_sync, tx_id, "К возмещению"
+  )
+  if ok:
+    await callback.message.edit_text(
+        "✅ <b>Дневное такси одобрено!</b> Сумма добавлена к выплате."
+    )
+  else:
+    await callback.message.edit_text("⚠️ Ошибка обновления статуса.")
+
+
+@dp.callback_query(F.data.startswith("rejtaxi_"))
+async def cb_rej_taxi(callback: types.CallbackQuery):
+  await callback.answer()
+  tx_id = callback.data.replace("rejtaxi_", "")
+  await asyncio.to_thread(update_expense_status_sync, tx_id, "Отклонено")
+  await callback.message.edit_text("❌ Дневное такси отклонено.")
+
+
+# --- ПАНЕЛЬ УПРАВЛЕНИЯ (ADMIN + MANAGERS) ---
+
+
+@dp.message(F.text == "💼 Панель управления")
+@dp.message(Command("admin"))
+async def admin_panel_handler(message: types.Message):
+  if not is_manager_or_admin(message.from_user.id):
+    await message.answer("⛔️ Нет прав доступа.")
+    return
+  await render_admin_menu(message)
+
+
+async def render_admin_menu(event_target):
+  user_id = (
+      event_target.from_user.id
+      if isinstance(event_target, types.Message)
+      else event_target.from_user.id
+  )
+
+  buttons = [
+      [
+          InlineKeyboardButton(
+              text="➕ Создать проект (Голос/Текст)",
+              callback_data="admin_create_project",
+          ),
+          InlineKeyboardButton(
+              text="⚡️ Быстрый расход", callback_data="admin_fast_expense"
+          ),
+      ],
+      [
+          InlineKeyboardButton(
+              text=f"⏱ Смены команды онлайн ({len(active_shifts)})",
+              callback_data="admin_view_active_shifts",
+          )
+      ],
+  ]
+
+  if is_admin(user_id):
+    debts = await asyncio.to_thread(get_debts_summary_sync)
+    total_debt = sum(debts.values()) if debts else 0
+    text = (
+        "💼 <b>Панель Главного Администратора</b>\n\n"
+        f"💵 <b>Текущий долг перед командой:</b> {total_debt:,.0f} ₸\n"
+        f"⏱ <b>Сотрудников на смене:</b> {len(active_shifts)}\n\n"
+        "Выберите действие:"
+    )
+    buttons.extend([
+        [
+            InlineKeyboardButton(
+                text="🏁 Завершить проект", callback_data="admin_close_project"
+            ),
+            InlineKeyboardButton(
+                text=f"💸 Выплаты ({len(debts)})",
+                callback_data="admin_payouts_list",
+            ),
+        ],
+        [
+            InlineKeyboardButton(
+                text="👥 Управляющие", callback_data="admin_manage_roles"
+            ),
+            InlineKeyboardButton(
+                text="🛠 Починить формулы", callback_data="admin_repair_tables"
+            ),
+        ],
+    ])
+  else:
+    text = (
+        "💼 <b>Панель Управляющего проектами</b>\n\n"
+        f"⏱ <b>Сотрудников на смене:</b> {len(active_shifts)}\n"
+        "Вам доступно создание проектов, быстрые расходы и мониторинг смен:"
+    )
+
+  buttons.append(
+      [InlineKeyboardButton(text="🔄 Обновить", callback_data="admin_hub")]
+  )
+  kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+  if isinstance(event_target, types.Message):
+    await event_target.answer(text, reply_markup=kb, parse_mode="HTML")
+  else:
+    await event_target.message.edit_text(
+        text, reply_markup=kb, parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "admin_hub")
+async def cb_admin_hub(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
+  await state.clear()
+  await render_admin_menu(callback)
+
+
+@dp.callback_query(F.data == "admin_view_active_shifts")
+async def cb_view_active_shifts(callback: types.CallbackQuery):
+  await callback.answer()
+  if not active_shifts:
+    await callback.message.edit_text(
+        "⏱ <b>Активные смены команды</b>\n\n"
+        "Сейчас никто из сотрудников не находится на смене.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="⬅️ Назад", callback_data="admin_hub"
+                )
+            ]]
+        ),
+        parse_mode="HTML",
+    )
+    return
+
+  now = get_now_astana()
+  text = "⏱ <b>Активные смены команды прямо сейчас:</b>\n\n"
+  for u_id, shift in active_shifts.items():
+    start_dt = shift["start_time"]
+    duration = now - start_dt
+    hrs = int(duration.total_seconds() // 3600)
+    mins = int((duration.total_seconds() % 3600) // 60)
+    text += (
+        f"👤 <b>{shift.get('employee', 'Сотрудник')}</b>\n"
+        f"🎯 Проект: <i>{shift['project']}</i>\n"
+        f"🕒 Начал: <b>{start_dt.strftime('%H:%M')}</b> (прошло: {hrs} ч."
+        f" {mins} мин.)\n\n"
+    )
+
+  await callback.message.edit_text(
+      text,
+      reply_markup=InlineKeyboardMarkup(
+          inline_keyboard=[[
+              InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")
+          ]]
+      ),
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data == "admin_manage_roles")
+async def cb_admin_manage_roles(callback: types.CallbackQuery):
+  await callback.answer()
+  if not is_admin(callback.from_user.id):
+    return
+  team = await asyncio.to_thread(get_all_team_roles_sync)
+  kb = []
+  for name, role in team:
+    is_m = "управл" in role.lower() or "менедж" in role.lower()
+    icon = "⭐️ [Управляющий]" if is_m else "👤 [Команда]"
+    kb.append([
+        InlineKeyboardButton(
+            text=f"{icon} {name}", callback_data=f"togglerole_{name[:20]}"
+        )
+    ])
+  kb.append(
+      [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")]
+  )
+  await callback.message.edit_text(
+      "👥 <b>Управление ролями команды</b>\n\n"
+      "Нажмите на сотрудника, чтобы сделать его <b>Управляющим</b> (или вернуть"
+      " в Команду):\n"
+      "<i>(Роль мгновенно сохранится в Google Таблицу)</i>",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("togglerole_"))
+async def cb_toggle_role(callback: types.CallbackQuery):
+  await callback.answer()
+  emp_prefix = callback.data.replace("togglerole_", "")
+  team = await asyncio.to_thread(get_all_team_roles_sync)
+  target_name = next(
+      (n for n, r in team if n.startswith(emp_prefix)), emp_prefix
+  )
+  curr_role = next((r for n, r in team if n == target_name), "Команда")
+  new_role = (
+      "Команда"
+      if ("управл" in curr_role.lower() or "менедж" in curr_role.lower())
+      else "Управляющий"
+  )
+
+  await asyncio.to_thread(set_employee_role_sync, target_name, new_role)
+  await asyncio.to_thread(load_managers_from_sheets_sync)
+  await cb_admin_manage_roles(callback)
+
+
+@dp.callback_query(F.data == "admin_close_project")
+async def cb_admin_close_project(callback: types.CallbackQuery):
+  await callback.answer()
+  projects = await asyncio.to_thread(get_filtered_projects_sync, True)
+  active_projs = [p for p in projects if p != "Склад / Общее"]
+  if not active_projs:
+    await callback.message.edit_text("🏁 Все проекты уже завершены!")
+    return
+  kb = [
+      [
+          InlineKeyboardButton(
+              text=f"🏁 {p}", callback_data=f"closeproj_{p[:25]}"
+          )
+      ]
+      for p in active_projs
+  ]
+  kb.append(
+      [InlineKeyboardButton(text="⬅️ Отмена", callback_data="admin_hub")]
+  )
+  await callback.message.edit_text(
+      "Выберите проект для перевода в статус <b>«Завершен»</b>:",
+      reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("closeproj_"))
+async def cb_confirm_close_proj(callback: types.CallbackQuery):
+  await callback.answer("Завершаю...")
+  proj_prefix = callback.data.replace("closeproj_", "")
+  closed = await asyncio.to_thread(
+      set_project_status_sync, proj_prefix, "Завершен"
+  )
+  await callback.message.edit_text(
+      f"✅ Проект <b>{closed}</b> успешно завершен и скрыт из меню!",
+      reply_markup=InlineKeyboardMarkup(
+          inline_keyboard=[[
+              InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")
+          ]]
+      ),
+      parse_mode="HTML",
+  )
+
+
+# --- ВЫПЛАТЫ КОМАНДЕ (ПРОИЗВОЛЬНАЯ СУММА + АВАНС) ---
+
+
+@dp.callback_query(F.data == "admin_payouts_list")
+async def cb_admin_payouts_list(callback: types.CallbackQuery):
+  await callback.answer()
+  if not is_admin(callback.from_user.id):
+    return
+
+  debts = await asyncio.to_thread(get_debts_summary_sync)
+  buttons = []
+  if not debts:
+    text = "💼 <b>Выплаты команде</b>\n\n🎉 Все долги закрыты!"
+  else:
+    total_debt = sum(debts.values())
+    text = (
+        f"💼 <b>Выплаты команде</b>\n\n💵 Общий долг: <b>{total_debt:,.0f} ₸</b>\n\n"
+    )
+    for person, sum_amt in debts.items():
+      text += f"• <b>{person}</b>: {sum_amt:,.0f} ₸\n"
+      buttons.append([
+          InlineKeyboardButton(
+              text=f"💸 Выплатить: {person} ({sum_amt:,.0f} ₸)",
+              callback_data=f"payprep_{person[:25]}",
+          )
+      ])
+
+  buttons.append(
+      [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_hub")]
+  )
+  kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+  await callback.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("payprep_"))
+async def cb_pay_person_prep(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
+  if not is_admin(callback.from_user.id):
+    return
+
+  person_prefix = callback.data.replace("payprep_", "")
+  debts = await asyncio.to_thread(get_debts_summary_sync)
+  full_name = next(
+      (p for p in debts if p.startswith(person_prefix)), person_prefix
+  )
+  debt_amount = debts.get(full_name, 0.0)
+  reqs = await asyncio.to_thread(get_employee_requisites_sync, full_name)
+
+  await state.update_data(target_employee=full_name, current_debt=debt_amount)
+
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text=f"✅ Выплатить ровно долг ({debt_amount:,.0f} ₸)",
+                  callback_data=f"confirmpay_exact_{person_prefix[:20]}",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="✏️ Ввести другую сумму (с переплатой/авансом)",
+                  callback_data="pay_custom_amount",
+              )
+          ],
+          [
+              InlineKeyboardButton(
+                  text="⬅️ Назад", callback_data="admin_payouts_list"
+              )
+          ],
+      ]
+  )
+
+  await callback.message.edit_text(
+      f"💼 <b>Выплата сотруднику:</b> {full_name}\n\n"
+      f"💵 <b>Текущий долг к выплате:</b> <code>{debt_amount:,.0f}</code> ₸\n\n"
+      f"📋 <b>Реквизиты Kaspi:</b>\n<code>{reqs}</code>\n\n"
+      "<i>Выберите действие или введите точную сумму перевода:</i>",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data.startswith("confirmpay_exact_"))
+async def cb_confirm_exact_pay(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer("Списываю...")
+  data = await state.get_data()
+  emp_name = data.get("target_employee")
+  debt = data.get("current_debt", 0.0)
+  await state.clear()
+
+  await asyncio.to_thread(process_custom_payout_sync, emp_name, debt, debt)
+  await callback.message.edit_text(
+      f"✅ Долг сотруднику <b>{emp_name}</b> на сумму <b>{debt:,.0f} ₸</b>"
+      " полностью погашен!"
+  )
+  await render_admin_menu(callback)
+
+
+@dp.callback_query(F.data == "pay_custom_amount")
+async def cb_ask_custom_amount(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer()
+  data = await state.get_data()
+  emp_name = data.get("target_employee", "Сотрудник")
+  debt = data.get("current_debt", 0.0)
+
+  await state.set_state(CustomPayoutState.waiting_for_amount)
+  await callback.message.edit_text(
+      f"👤 Сотрудник: <b>{emp_name}</b> (долг: {debt:,.0f} ₸)\n\n"
+      "💸 <b>Введите фактически переведенную сумму числом:</b>\n"
+      "<i>(Если вы перевели больше долга, разница автоматически перейдет на его"
+      " баланс как аванс)</i>\n\n"
+      "Например: <code>50000</code>",
+      parse_mode="HTML",
+  )
+
+
+@dp.message(CustomPayoutState.waiting_for_amount, F.text)
+async def process_custom_amount_input(
+    message: types.Message, state: FSMContext
+):
+  try:
+    payout_val = float(message.text.replace(" ", "").replace(",", ".").strip())
+  except ValueError:
+    await message.answer("⚠️ Введите число (например: 50000):")
+    return
+
+  data = await state.get_data()
+  emp_name = data.get("target_employee", "Сотрудник")
+  debt = data.get("current_debt", 0.0)
+  await state.clear()
+
+  wait_msg = await message.answer("⏳ Обновляю баланс в таблице...")
+  await asyncio.to_thread(
+      process_custom_payout_sync, emp_name, payout_val, debt
+  )
+
+  diff = payout_val - debt
+  if diff > 0.01:
+    res_text = (
+        f"✅ <b>Выплата проведена с переплатой!</b>\n\n"
+        f"👤 Сотрудник: <b>{emp_name}</b>\n"
+        f"💵 Долг был: {debt:,.0f} ₸\n"
+        f"💳 Переведено: <b>{payout_val:,.0f} ₸</b>\n"
+        f"🟢 <b>Аванс на баланс сотрудника: +{diff:,.0f} ₸</b>\n\n"
+        "<i>Эта переплата автоматически зачтется в следующих расходах!</i>"
+    )
+  elif diff < -0.01:
+    res_text = (
+        f"✅ <b>Частичная выплата проведена!</b>\n\n"
+        f"👤 Сотрудник: <b>{emp_name}</b>\n"
+        f"💵 Долг был: {debt:,.0f} ₸\n"
+        f"💳 Выплачено: <b>{payout_val:,.0f} ₸</b>\n"
+        f"⚠️ <b>Остаток долга: {abs(diff):,.0f} ₸</b>"
+    )
+  else:
+    res_text = (
+        f"✅ Долг сотруднику <b>{emp_name}</b> на сумму <b>{payout_val:,.0f}"
+        " ₸</b> закрыт ровно в ноль!"
+    )
+
+  await wait_msg.edit_text(
+      res_text,
+      reply_markup=InlineKeyboardMarkup(
+          inline_keyboard=[[
+              InlineKeyboardButton(
+                  text="⬅️ В панель управления", callback_data="admin_hub"
+              )
+          ]]
+      ),
+      parse_mode="HTML",
+  )
+
+
+# --- СОЗДАНИЕ МЕРОПРИЯТИЙ (ГОЛОС SPEECHKIT + GEMINI / ТЕКСТ) ---
+
+
+@dp.callback_query(F.data == "admin_create_project")
+async def cb_start_create_project(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer()
+  await state.set_state(ProjectCreationState.waiting_for_input)
+  await callback.message.edit_text(
+      "➕ <b>Создание нового мероприятия</b>\n\n"
+      "🎙 <b>Надиктуйте голосовое</b> ИЛИ ✍️ <b>напишите текстом:</b>\n\n"
+      "<i>Пример:\n«25.09 Концерт Баста, Дворец Спорта, смета 1.5 млн,"
+      " предоплата 50%»</i>",
+      parse_mode="HTML",
+  )
+
+
+async def render_project_card(target, data: dict):
+  event_date = data.get("event_date", "-")
+  proj_name = data.get("project_name", "-")
+  location = data.get("location", "-")
+  price = float(data.get("price", 0))
+  prepay_pct = int(data.get("prepay_percent", 0))
+  paid_preview = price * (prepay_pct / 100.0)
+
+  text = (
+      "📋 <b>Проверьте данные проекта:</b>\n\n"
+      f"📅 <b>Дата:</b> {event_date}\n"
+      f"🎯 <b>Название:</b> {proj_name}\n"
+      f"📍 <b>Площадка:</b> {location}\n"
+      f"💵 <b>Смета:</b> {price:,.0f} ₸\n"
+      f"💰 <b>Предоплата:</b> {prepay_pct}% ({paid_preview:,.0f} ₸)\n\n"
+      "Всё верно?"
+  )
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="✅ Все верно, создать!",
+                  callback_data="confirm_voice_proj",
+              )
+          ],
+          [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_hub")],
+      ]
+  )
+  if isinstance(target, types.Message):
+    await target.edit_text(text, reply_markup=kb, parse_mode="HTML")
+  else:
+    await target.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+async def parse_project_with_ai(
+    message: types.Message, state: FSMContext, input_data
+):
+  status_msg = await message.answer("🎧 Распознаю проект...")
+  prompt = """
+    Ты финансовый ассистент компании сценического оборудования.
+    Извлеки данные проекта и верни ТОЛЬКО JSON:
+    {
+      "event_date": "дата ДД.ММ (если не названа, текущая)",
+      "project_name": "название без даты",
+      "location": "площадка",
+      "price": общая сумма числом,
+      "prepay_percent": 0, 50 или 100
+    }
+    """
+  try:
+    if isinstance(input_data, bytes):
+      recognized_text = await recognize_speech_yandex(input_data)
+      contents = (
+          [f'Текст: "{recognized_text}"', prompt]
+          if recognized_text
+          else [
+              genai_types.Part.from_bytes(
+                  data=input_data, mime_type="audio/ogg"
+              ),
+              prompt,
+          ]
+      )
+    else:
+      contents = [f'Текст: "{input_data}"', prompt]
+
+    resp_text = await call_gemini_safe(contents, json_mode=True)
+    raw = resp_text.strip()
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    data = json.loads(raw[start:end])
+
+    await state.set_state(ProjectCreationState.waiting_for_input)
+    await state.update_data(
+        event_date=data.get(
+            "event_date", get_now_astana().strftime("%d.%m")
+        ),
+        project_name=data.get("project_name", "Мероприятие"),
+        location=data.get("location", "Не указана"),
+        price=float(data.get("price", 0)),
+        prepay_percent=int(data.get("prepay_percent", 0)),
+    )
+    await render_project_card(status_msg, await state.get_data())
+  except Exception as e:
+    await status_msg.edit_text(f"⚠️ Ошибка разбора: {e}")
+
+
+@dp.message(ProjectCreationState.waiting_for_input, F.voice | F.audio)
+@dp.message(F.from_user.id.in_(authenticated_admins), F.voice | F.audio)
+async def process_project_voice(message: types.Message, state: FSMContext):
+  voice_obj = message.voice or message.audio
+  file_io = io.BytesIO()
+  await bot.download(voice_obj, destination=file_io)
+  await parse_project_with_ai(message, state, file_io.getvalue())
+
+
+@dp.message(ProjectCreationState.waiting_for_input, F.text)
+async def process_project_text(message: types.Message, state: FSMContext):
+  await parse_project_with_ai(message, state, message.text.strip())
+
+
+@dp.callback_query(F.data == "confirm_voice_proj")
+async def cb_confirm_voice_proj(
+    callback: types.CallbackQuery, state: FSMContext
+):
+  await callback.answer()
+  data = await state.get_data()
+  if not data or "project_name" not in data:
+    await callback.answer("Данные устарели", show_alert=True)
+    return
+
+  await callback.message.edit_text("⏳ Записываю проект в Google Таблицу...")
+
+  def add_proj():
+    ws = spreadsheet.worksheet("Проекты")
+    next_row = len(ws.col_values(1)) + 1
+    event_date = data.get("event_date", "").strip()
+    raw_name = data.get("project_name", "").strip()
+    full_name = (
+        f"{event_date} {raw_name}"
+        if event_date and not raw_name.startswith(event_date)
+        else raw_name
+    )
+
+    total_price = float(data.get("price", 0))
+    prepay_pct = int(data.get("prepay_percent", 0))
+    paid = total_price * (prepay_pct / 100.0)
+
+    formula_exp = f'=SUMIFS(Операции!F:F; Операции!D:D; A{next_row}; Операции!C:C; "Расход")'
+    formula_prof = f"=D{next_row}-E{next_row}"
+    formula_marg = f"=IF(D{next_row}>0; F{next_row}/D{next_row}; 0)"
+
+    ws.append_row(
+        [
+            full_name,
+            data.get("location", "Площадка"),
+            "В работе",
+            total_price,
+            formula_exp,
+            formula_prof,
+            formula_marg,
+        ],
+        value_input_option="USER_ENTERED",
+    )
+    if paid > 0:
+      ws_ops = spreadsheet.worksheet("Операции")
+      ws_ops.append_row(
+          [
+              f"TX-{random.randint(10000, 99999)}",
+              get_now_astana().strftime("%d.%m.%Y %H:%M"),
+              "Доход",
+              full_name,
+              "Комплексный продакшн",
+              paid,
+              "Клиент",
+              "Не требуется",
+              "-",
+              f"Предоплата ({prepay_pct}%)",
+          ],
+          value_input_option="USER_ENTERED",
+      )
+    return full_name
+
+  try:
+    proj_title = await asyncio.to_thread(add_proj)
+    await state.clear()
+    await callback.message.edit_text(
+        f"✅ <b>Мероприятие создано!</b>\n\n🎯 <b>{proj_title}</b>\n💵 Смета:"
+        f" {data.get('price', 0):,.0f} ₸",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="⬅️ В панель управления", callback_data="admin_hub"
+                )
+            ]]
+        ),
+        parse_mode="HTML",
+    )
+  except Exception as e:
+    await callback.message.edit_text(f"⚠️ Ошибка: {e}")
+
+
+# --- БЫСТРЫЙ РАСХОД (1 ШАГ) ---
+
+
+@dp.callback_query(F.data == "admin_fast_expense")
+async def cb_fast_exp_start(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
+  kb = await render_project_keyboard("fastexp", show_all=False)
+  await callback.message.edit_text(
+      "⚡️ <b>Быстрый расход</b>\nВыберите проект:",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
+
+
+@dp.callback_query(F.data == "fastexp_showall")
+async def cb_fastexp_showall(callback: types.CallbackQuery):
+  await callback.answer()
+  kb = await render_project_keyboard("fastexp", show_all=True)
+  await callback.message.edit_reply_markup(reply_markup=kb)
+
+
+@dp.callback_query(
+    F.data.startswith("fastexp_") & (F.data != "fastexp_showall")
+)
+async def cb_fast_exp_proj(callback: types.CallbackQuery, state: FSMContext):
+  await callback.answer()
+  proj_short = callback.data.replace("fastexp_", "")
+  projects = await asyncio.to_thread(get_filtered_projects_sync, True)
+  full_project = next(
+      (p for p in projects if p.startswith(proj_short)), "Склад / Общее"
+  )
+
+  await state.update_data(project=full_project)
+  await state.set_state(QuickExpenseState.waiting_for_details)
+  await callback.message.edit_text(
+      f"🎯 Проект: <b>{full_project}</b>\n\n"
+      "Напишите сумму и суть одной строчкой:\n"
+      "<i>Например: <code>75000 субаренда микрофонов</code> или <code>20000"
+      " газель лично</code></i>",
+      parse_mode="HTML",
+  )
+
+
+@dp.message(QuickExpenseState.waiting_for_details, F.text)
+async def process_fast_exp(message: types.Message, state: FSMContext):
+  text_input = message.text.strip()
+  data = await state.get_data()
+  project = data.get("project", "Склад / Общее")
+  await state.clear()
+
+  status_msg = await message.answer("🤖 Разбираю расход...")
+  prompt = f"""
+    Расход: "{text_input}".
+    Извлеки JSON:
+    - "amount": число,
+    - "category": категория ("Субаренда оборудования", "Гонорары наемным техникам", "Такси / Логистика / ГСМ", "Расходники (тейп, батарейки)", "Склад / Ремонт оборудования", "Прочее"),
+    - "description": суть покупки,
+    - "is_personal": true если написано "лично", "из своих", иначе false.
+    """
+  try:
+    resp_text = await call_gemini_safe(prompt, json_mode=True)
+    raw = resp_text.strip()
+    start = raw.find("{")
+    end = raw.rfind("}") + 1
+    exp_data = json.loads(raw[start:end])
+
+    amount = float(exp_data.get("amount", 0))
+    category = exp_data.get("category", "Прочее")
+    desc = exp_data.get("description", text_input)
+    is_personal = exp_data.get("is_personal", False)
+
+    payer = (
+        await get_or_register_employee(message.from_user)
+        if is_personal
+        else "Касса / ИП"
+    )
+    status_str = "К возмещению" if is_personal else "Не требуется"
+
+    await asyncio.to_thread(
+        log_expense_sync,
+        project,
+        category,
+        amount,
+        message.from_user,
+        desc,
+        "Вручную (быстрый ввод)",
+        payer,
+        status_str,
+    )
+    await status_msg.edit_text(
+        f"✅ <b>Расход внесен!</b>\n🎯 {project}\n💵 {amount:,.0f} ₸ ({category})\n💳"
+        f" {payer} ({status_str})",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="⬅️ В панель управления", callback_data="admin_hub"
+                )
+            ]]
+        ),
+        parse_mode="HTML",
+    )
+  except Exception as e:
+    await status_msg.edit_text(f"⚠️ Ошибка: {e}")
+
+
+# --- ПЕРЕХВАТ ТЕКСТА РЕКВИЗИТОВ ---
+
+
+@dp.message(
+    StateFilter(None),
+    F.text & ~F.text.startswith("/") & ~F.text.in_(NAV_BUTTONS),
+)
+async def handle_user_text(message: types.Message):
+  user_id = message.from_user.id
+  if user_id in waiting_for_requisites:
+    del waiting_for_requisites[user_id]
+    employee = await get_or_register_employee(message.from_user)
+    await asyncio.to_thread(
+        save_employee_requisites_sync, employee, message.text.strip()
+    )
+    await message.answer(
+        f"✅ <b>Реквизиты сохранены!</b>\n\n👤 {employee}\n📋"
+        f" <code>{message.text.strip()}</code>",
+        reply_markup=get_main_keyboard(user_id),
+        parse_mode="HTML",
+    )
+
+
+# --- ТОЧКА ВХОДА И СЕРВЕР RENDER ---
 
 
 async def handle_ping(request):
-  return web.Response(text="Bot is active 24/7!")
+  return web.Response(text="Bot is active in Astana UTC+5!")
 
 
 async def main():
@@ -1789,10 +2118,12 @@ async def main():
   site = web.TCPSite(runner, "0.0.0.0", port)
   await site.start()
 
-  print("Синхронизируем формулы с таблицей...")
+  print(
+      f"Сервер слушает порт {port}, время Астаны:"
+      f" {get_now_astana().strftime('%Y-%m-%d %H:%M:%S')}"
+  )
   await asyncio.to_thread(repair_spreadsheet_sync)
-
-  print(f"Сервер слушает порт {port}, запускаем бота...")
+  await asyncio.to_thread(load_managers_from_sheets_sync)
   await dp.start_polling(bot)
 
 
