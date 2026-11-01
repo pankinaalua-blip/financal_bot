@@ -34,7 +34,7 @@ import gspread
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA").strip()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 GOOGLE_CALENDAR_ID = os.getenv("GOOGLE_CALENDAR_ID", "").strip()
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "disa2026").strip()
@@ -166,7 +166,7 @@ def resolve_calendar_sync(date_str: str) -> str:
     t_min = datetime(dt.year, dt.month, dt.day, 0, 0, tzinfo=TZ_ASTANA).isoformat()
     t_max = datetime(dt.year, dt.month, dt.day, 23, 59, tzinfo=TZ_ASTANA).isoformat()
     cal_id = urllib.parse.quote(GOOGLE_CALENDAR_ID)
-    url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events?timeMin={ urllib.parse.quote(t_min)}&timeMax={urllib.parse.quote(t_max)}&singleEvents=true"
+    url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events?timeMin={urllib.parse.quote(t_min)}&timeMax={urllib.parse.quote(t_max)}&singleEvents=true"
 
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {creds.token}"})
     with urllib.request.urlopen(req, timeout=6) as r:
@@ -261,7 +261,6 @@ def add_operation_sync(
 
 
 def get_debts_sync(filter_emp: str = None):
-  """Читает лист Операции (F=Сумма, G=Кто, H=Статус, D=Дата, J=Комментарий)"""
   rows = spreadsheet.worksheet("Операции").get_all_values()[1:]
   debts = {}
   items = []
@@ -311,6 +310,7 @@ def date_picker_kb(action: str) -> IMarkup:
       ],
       [IBtn(text="🗓 Выбрать день в календаре", callback_data=f"cal|{action}|{now.year}|{now.month}")],
       [IBtn(text="🏢 Склад / Общее", callback_data=f"pdate|{action}|Склад / Общее")],
+      [IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")],
   ])
 
 
@@ -337,6 +337,7 @@ def month_grid_kb(action: str, year: int, month: int) -> IMarkup:
       IBtn(text="🔙 Быстрые даты", callback_data=f"qdate|{action}"),
       IBtn(text="➡️", callback_data=f"cal|{action}|{ny}|{nm}"),
   ])
+  kb.append([IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")])
   return IMarkup(inline_keyboard=kb)
 
 
@@ -360,18 +361,59 @@ async def cb_qdate_nav(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 4. БАЗОВОЕ МЕНЮ, БАЛАНС И РЕКВИЗИТЫ
+# 4. ЗАЩИТА ОТ ЗАВИСАНИЯ И БАЗОВОЕ МЕНЮ
 # =====================================================================
 
 
+# Сброс зависшего FSM при клике на любую кнопку нижнего меню или /cancel
+@dp.message(Command("cancel"))
+@dp.message(StateFilter("*"), F.text.in_(NAV_BTNS))
+async def cancel_active_fsm_on_nav(m: types.Message, state: FSMContext):
+  await state.clear()
+  waiting_reqs.discard(m.from_user.id)
+
+  if m.text in NAV_BTNS:
+    if m.text == "⏱ Моя смена":
+      await msg_shift(m)
+    elif m.text == "🍔 Обед (2 500 ₸)":
+      await msg_meal(m)
+    elif m.text in {"🚕 Такси", "🧾 Отправить чек"}:
+      await msg_send_receipt_prompt(m)
+    elif m.text == "💰 Мой баланс":
+      await msg_balance(m)
+    elif m.text == "💳 Реквизиты":
+      await msg_reqs(m)
+    elif m.text == "⚙️ Управление":
+      await cmd_panel(m)
+    return
+
+  await m.answer(
+      "🔄 <b>Ввод отменен.</b> Меню готово к работе!",
+      reply_markup=main_kb(m.from_user.id),
+      parse_mode="HTML",
+  )
+
+
+# Инлайн-кнопка отмены под запросом ввода
+@dp.callback_query(F.data == "cancel_fsm_action")
+async def cb_cancel_fsm_action(c: types.CallbackQuery, state: FSMContext):
+  await c.answer("Отменено")
+  await state.clear()
+  waiting_reqs.discard(c.from_user.id)
+  await c.message.edit_text("❌ <b>Действие отменено.</b> Меню готово к работе.", parse_mode="HTML")
+
+
 @dp.message(CommandStart())
-async def cmd_start(m: types.Message):
+async def cmd_start(m: types.Message, state: FSMContext):
+  await state.clear()
+  waiting_reqs.discard(m.from_user.id)
+
   name = await get_emp(m.from_user)
   await m.answer(
       f"👋 <b>Привет, {name}!</b>\n"
       f"━━━━━━━━━━━━━━\n"
       f"🕒 Часовой пояс: <b>Астана ({now_astana().strftime('%H:%M')})</b>\n\n"
-      f"<blockquote>💡 <b>Быстрый совет:</b> Вы можете просто отправить фото чека или скриншот такси в этот чат в любой момент — бот сам распознает сумму и предложит дату!</blockquote>",
+      f"<blockquote>💡 <b>Быстрый совет:</b> Вы можете просто отправить фото чека или скриншот такси в этот чат в любой момент — бот сам считает сумму и предложит дату!</blockquote>",
       reply_markup=main_kb(m.from_user.id),
       parse_mode="HTML",
   )
@@ -405,7 +447,7 @@ async def msg_balance(m: types.Message):
   total = sum(x["amount"] for x in items)
 
   if total < -0.01:
-    status = f"🟢 <b>Аванс на балансе: +{abs(total):,.0f} ₸</b>\n<i>Сумма автоматически покроет ваши следующие чеки.</i>"
+    status = f"🟢 <b>Аванс на балансе: +{abs(total):,.0f} ₸</b>\n<i>Сумма автоматически зачтется в счет ваших следующих чеков.</i>"
   elif total > 0.01:
     status = f"💵 <b>К выплате вам: {total:,.0f} ₸</b>"
   else:
@@ -444,9 +486,11 @@ async def msg_reqs(m: types.Message):
 async def cb_edit_reqs(c: types.CallbackQuery):
   await c.answer()
   waiting_reqs.add(c.from_user.id)
+  kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
   await c.message.edit_text(
       "📝 <b>Отправьте ваши реквизиты одним сообщением</b>\n"
       "<blockquote>Пример: +7 777 123 45 67 Kaspi / ИИН</blockquote>",
+      reply_markup=kb,
       parse_mode="HTML",
   )
 
@@ -548,7 +592,7 @@ async def msg_shift(m: types.Message):
     ])
     await m.answer(
         "⏱ <b>Управление рабочей сменой</b>\n━━━━━━━━━━━━━━\n"
-        "Сейчас у вас нет активной смены. Каждые 6 часов смены автоматически начисляют <b>2 500 ₸</b> обеденных.",
+        "Сейчас у вас нет активной смены. Каждые 6 часов смены начисляют <b>2 500 ₸</b> обеденных.",
         reply_markup=kb,
         parse_mode="HTML",
     )
@@ -748,7 +792,7 @@ async def handle_receipt_photo(m: types.Message):
   )
 
 
-# Единый маршрутизатор выбора даты для всех функций
+# Единый обработчик дат календаря
 @dp.callback_query(F.data.startswith("pdate|"))
 async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
   await c.answer()
@@ -764,7 +808,7 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     await asyncio.to_thread(add_operation_sync, label, "Питание команды", 2500, emp, "Обеденные (норматив)")
     await c.message.edit_text(f"✅ <b>Обеденные 2 500 ₸ начислены!</b>\n📅 Дата: <b>{label}</b>", parse_mode="HTML")
 
-  # 2. Старт смены сейчас
+  # 2. Старт смены прямо сейчас
   elif act == "s_now":
     emp = await get_emp(c.from_user)
     now = now_astana()
@@ -784,13 +828,15 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
   elif act == "s_retro":
     await state.update_data(date=label)
     await state.set_state(Form.retro_time)
+    kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
     await c.message.edit_text(
-        f"📅 Дата: <b>{label}</b>\n\n🕒 <b>Введите фактическое время начала смены:</b>\n"
+        f"📅 Дата: <b>{label}</b>\n\n🕒 <b>Введите время начала смены:</b>\n"
         f"<blockquote>Например: <code>14:00</code> или <code>3 часа назад</code></blockquote>",
+        reply_markup=kb,
         parse_mode="HTML",
     )
 
-  # 4. Сохранение фото-чека
+  # 4. Сохранение чека
   elif act == "check":
     rec = pending_receipts.pop(uid, None)
     if not rec:
@@ -837,14 +883,16 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
         parse_mode="HTML",
     )
 
-  # 5. Быстрый расход админа
+  # 5. Быстрый расход
   elif act == "fastexp":
     await state.update_data(date=label)
     await state.set_state(Form.fast_expense)
+    kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
     await c.message.edit_text(
         f"📅 Дата: <b>{label}</b>\n\n✍️ <b>Напишите сумму и описание одной строкой:</b>\n"
         f"<blockquote>• <code>75000 субаренда микрофонов</code> (с кассы ИП)\n"
         f"• <code>15000 газель лично</code> (к возмещению вам)</blockquote>",
+        reply_markup=kb,
         parse_mode="HTML",
     )
 
@@ -865,7 +913,7 @@ async def cb_taxi_decision(c: types.CallbackQuery):
 
   await asyncio.to_thread(upd)
   icon = "✅ Одобрено" if act == "tx_ok" else "❌ Отклонено"
-  await c.message.edit_text(f"{icon}: статус транзакции {tx_id} обновлен на <b>{new_st}</b>.", parse_mode="HTML")
+  await c.message.edit_text(f"{icon}: статус транзакции {tx_id} изменен на <b>{new_st}</b>.", parse_mode="HTML")
 
 
 # =====================================================================
@@ -920,7 +968,7 @@ async def cb_adm_back(c: types.CallbackQuery, state: FSMContext):
 async def cb_adm_fix(c: types.CallbackQuery):
   await c.answer("Синхронизирую...")
   await asyncio.to_thread(sync_roles_and_formulas)
-  await c.message.answer("✅ Формулы и роли синхронизированы!")
+  await c.message.answer("✅ Формулы и роли успешно обновлены!")
 
 
 @dp.callback_query(F.data == "adm_fast")
@@ -1059,7 +1107,11 @@ def settle_payout_sync(emp: str, paid: float, debt: float):
   diff = paid - debt
   if abs(diff) > 0.01:
     amt = -diff if diff > 0 else abs(diff)
-    note = f"Аванс на баланс (выплачено {paid:,.0f} при долге {debt:,.0f})" if diff > 0 else f"Остаток долга (выплачено {paid:,.0f} из {debt:,.0f})"
+    note = (
+        f"Аванс на баланс (выплачено {paid:,.0f} при долге {debt:,.0f})"
+        if diff > 0
+        else f"Остаток долга (выплачено {paid:,.0f} из {debt:,.0f})"
+    )
     add_operation_sync("Склад / Общее", "Взаиморасчеты", amt, emp, note, "К возмещению", "Перевод Kaspi")
 
 
@@ -1078,10 +1130,12 @@ async def cb_pay_custom(c: types.CallbackQuery, state: FSMContext):
   await c.answer()
   d = await state.get_data()
   await state.set_state(Form.custom_payout)
+  kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
   await c.message.edit_text(
       f"👤 <b>{d['emp']}</b> (долг: {d['debt']:,.0f} ₸)\n\n"
       f"💸 <b>Введите фактически переведенную сумму числом:</b>\n"
       f"<blockquote>Если сумма больше долга, разница станет авансом сотрудника.</blockquote>",
+      reply_markup=kb,
       parse_mode="HTML",
   )
 
