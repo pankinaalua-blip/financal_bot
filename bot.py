@@ -28,14 +28,13 @@ from google.genai import types as genai_types
 import gspread
 
 # =====================================================================
-# 1. КОНФИГУРАЦИЯ (ID ТАБЛИЦЫ И ПАПКИ ВСТРОЕНЫ ПО УМОЛЧАНИЮ)
+# 1. КОНФИГУРАЦИЯ (ВСТРОЕНЫ ТАБЛИЦА И ПАПКА «ЧЕКИ»)
 # =====================================================================
 
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-# Встроенные ID Google Таблицы и папки для чеков
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA").strip()
 RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "13ze6D8nDnjGtZ7QDOQAr5iZnyrVnLcEH").strip()
 
@@ -91,6 +90,7 @@ class Form(StatesGroup):
   meal_comment = State()
   fast_expense = State()
   custom_payout = State()
+  advance_amount = State()  # Состояние ввода суммы аванса
 
 
 def now_astana() -> datetime:
@@ -138,8 +138,6 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
       creds.refresh(Request())
 
     boundary = "===boundary==="
-
-    # Файл помещается строго в папку «Чеки»
     metadata = {
         "name": filename,
         "mimeType": "image/jpeg",
@@ -172,7 +170,7 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =====================================================================
-# 3. ТАБЛИЦА: 3 СТОЛБЦА РАСХОДОВ И РАСЧЕТНЫЕ ПЕРИОДЫ
+# 3. ТАБЛИЦА: ВСЕ АККАУНТЫ, АВАНСЫ И ВЫПЛАТЫ
 # =====================================================================
 
 
@@ -194,7 +192,6 @@ def sync_roles_and_formulas():
       if any(w in role for w in ["управл", "менедж", "admin"]):
         mgr_names.add(name.lower())
 
-      # Лист «Выплаты команде»: D=Баланс, E=Такси, F=Обеды, G=Прочие, H=Всего, I=Архив, J=Период
       ws_pay.update_cell(idx, 4, f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "К возмещению")')
       ws_pay.update_cell(idx, 5, f'=SUMIFS(Операции!E:E; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")')
       ws_pay.update_cell(idx, 6, f'=SUMIFS(Операции!F:F; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")')
@@ -210,6 +207,27 @@ def sync_roles_and_formulas():
           managers.add(int(cid))
   except Exception as e:
     print(f"Sync error: {e}")
+
+
+def get_all_team_members_sync():
+  """Возвращает всех сотрудников из таблицы и их текущий баланс"""
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    rows = ws_pay.get_all_values()[1:]
+    team = []
+    for r in rows:
+      if r and r[0].strip():
+        name = r[0].strip()
+        bal_str = str(r[3]).replace(" ", "").replace(",", ".").replace("₸", "") if len(r) > 3 else "0"
+        try:
+          bal = float(bal_str)
+        except ValueError:
+          bal = 0.0
+        team.append((name, bal))
+    return team
+  except Exception as e:
+    print(f"Team fetch error: {e}")
+    return []
 
 
 def get_employee_sync(user: types.User) -> str:
@@ -727,7 +745,7 @@ async def cb_retro_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД (С ПОДТВЕРЖДЕНИЕМ УПРАВЛЯЮЩЕГО)
+# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД
 # =====================================================================
 
 
@@ -1011,7 +1029,7 @@ async def cb_taxi_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 9. ПАНЕЛЬ УПРАВЛЕНИЯ И ВЫПЛАТЫ
+# 9. ПАНЕЛЬ УПРАВЛЕНИЯ, ВСЕ АККАУНТЫ, ВЫПЛАТЫ И АВАНСЫ
 # =====================================================================
 
 
@@ -1023,17 +1041,17 @@ async def render_control_panel(target, uid: int):
   cur_period = get_pay_period(now_astana())
 
   if is_admin(uid):
-    debts, _ = await asyncio.to_thread(get_debts_sync)
-    pos_debts = {k: v for k, v in debts.items() if v > 0}
-    tot = sum(pos_debts.values())
+    team_members = await asyncio.to_thread(get_all_team_members_sync)
+    tot = sum(bal for _, bal in team_members if bal > 0)
     header = (
         f"⚙️ <b>Панель Главного Администратора</b>\n━━━━━━━━━━━━━━\n"
         f"📅 Текущий период: <b>{cur_period}</b>\n"
         f"💵 Общий долг перед командой: <b>{tot:,.0f} ₸</b>\n"
+        f"👥 Сотрудников в системе: <b>{len(team_members)}</b>\n"
         f"🟢 Активных смен сейчас: <b>{len(active_shifts)}</b>"
     )
     btns.extend([
-        [IBtn(text=f"💸 Выплаты команде ({len(pos_debts)})", callback_data="adm_paylist")],
+        [IBtn(text=f"💸 Взаиморасчеты с командой ({len(team_members)})", callback_data="adm_paylist")],
         [IBtn(text="👥 Роли команды", callback_data="adm_roles"), IBtn(text="🔄 Формулы", callback_data="adm_fix")],
     ])
   else:
@@ -1157,31 +1175,48 @@ async def cb_toggle_role(c: types.CallbackQuery):
   await cb_adm_roles(c)
 
 
+# --- ПОКАЗ ВСЕХ АККАУНТОВ КОМАНДЫ (С АВАНСАМИ И ДОЛГАМИ) ---
 @dp.callback_query(F.data == "adm_paylist")
 async def cb_adm_paylist(c: types.CallbackQuery):
   await c.answer()
-  debts, _ = await asyncio.to_thread(get_debts_sync)
+  team = await asyncio.to_thread(get_all_team_members_sync)
   cur_period = get_pay_period(now_astana())
+
   kb = []
   lines = []
-  for emp, amt in debts.items():
-    if amt > 0:
-      lines.append(f"• <b>{emp}</b>: {amt:,.0f} ₸")
-      kb.append([IBtn(text=f"💸 Выплатить: {emp} ({amt:,.0f} ₸)", callback_data=f"pay|{emp[:20]}")])
-    elif amt < 0:
-      lines.append(f"• <b>{emp}</b>: 🟢 аванс +{abs(amt):,.0f} ₸")
+
+  for emp, bal in team:
+    if bal > 0:
+      status_txt = f"🔴 <b>{emp}</b>: <b>{bal:,.0f} ₸</b> (долг компании)"
+      btn_txt = f"💸 Выплатить: {emp} ({bal:,.0f} ₸)"
+    elif bal < 0:
+      status_txt = f"🟢 <b>{emp}</b>: <b>+{abs(bal):,.0f} ₸</b> (аванс)"
+      btn_txt = f"➕ Добавить аванс: {emp}"
+    else:
+      status_txt = f"⚪️ <b>{emp}</b>: <b>0 ₸</b> (расчетов нет)"
+      btn_txt = f"➕ Выдать аванс: {emp}"
+
+    lines.append(status_txt)
+    kb.append([IBtn(text=btn_txt, callback_data=f"pay|{emp[:20]}")])
+
   kb.append([IBtn(text="⬅️ Назад", callback_data="adm_back")])
-  body = "\n".join(lines) if lines else "🎉 Все долги перед командой закрыты!"
-  await c.message.edit_text(f"💸 <b>Выплаты за период: {cur_period}</b>\n━━━━━━━━━━━━━━\n{body}", reply_markup=IMarkup(inline_keyboard=kb), parse_mode="HTML")
+  body = "\n".join(lines) if lines else "Сотрудники в таблице не найдены."
+  await c.message.edit_text(
+      f"💸 <b>Взаиморасчеты со всеми сотрудниками</b>\n"
+      f"📅 Текущий период: <b>{cur_period}</b>\n━━━━━━━━━━━━━━\n"
+      f"{body}\n\n<i>Нажмите на сотрудника, чтобы провести выплату или пополнить баланс авансом:</i>",
+      reply_markup=IMarkup(inline_keyboard=kb),
+      parse_mode="HTML",
+  )
 
 
 @dp.callback_query(F.data.startswith("pay|"))
 async def cb_pay_prep(c: types.CallbackQuery, state: FSMContext):
   await c.answer()
   prefix = c.data.split("|")[1]
-  debts, _ = await asyncio.to_thread(get_debts_sync)
-  emp = next((k for k in debts if k.startswith(prefix)), prefix)
-  debt = debts.get(emp, 0.0)
+  team = await asyncio.to_thread(get_all_team_members_sync)
+  emp = next((k for k, _ in team if k.startswith(prefix)), prefix)
+  bal = next((v for k, v in team if k == emp), 0.0)
 
   def get_req():
     for r in spreadsheet.worksheet("Выплаты команде").get_all_values()[1:]:
@@ -1190,20 +1225,84 @@ async def cb_pay_prep(c: types.CallbackQuery, state: FSMContext):
     return "Не указаны"
 
   reqs = await asyncio.to_thread(get_req)
-  await state.update_data(emp=emp, debt=debt)
-  kb = IMarkup(inline_keyboard=[
-      [IBtn(text=f"✅ Выплатить ровно {debt:,.0f} ₸", callback_data="pay_exact")],
-      [IBtn(text="✏️ Ввести другую сумму (с авансом)", callback_data="pay_custom")],
-      [IBtn(text="⬅️ Назад", callback_data="adm_paylist")],
-  ])
+  await state.update_data(emp=emp, debt=bal)
+
+  btns = []
+  if bal > 0:
+    btns.append([IBtn(text=f"✅ Погасить долг ровно ({bal:,.0f} ₸)", callback_data="pay_exact")])
+    btns.append([IBtn(text="✏️ Частичная выплата / с переплатой", callback_data="pay_custom")])
+
+  btns.append([IBtn(text="🟢 ➕ Пополнить баланс авансом", callback_data="give_advance")])
+  btns.append([IBtn(text="⬅️ Назад к списку", callback_data="adm_paylist")])
+
+  bal_info = (
+      f"💵 <b>Текущий долг к выплате:</b> <code>{bal:,.0f} ₸</code>"
+      if bal > 0
+      else (f"🟢 <b>Аванс на балансе:</b> <code>+{abs(bal):,.0f} ₸</code>" if bal < 0 else "⚪️ <b>Баланс нулевой (0 ₸)</b>")
+  )
+
   await c.message.edit_text(
-      f"💸 <b>Выплата сотруднику: {emp}</b>\n━━━━━━━━━━━━━━\n"
-      f"💵 Долг к выплате: <b>{debt:,.0f} ₸</b>\n📋 Реквизиты:\n<blockquote><code>{reqs}</code></blockquote>",
+      f"👤 <b>Карточка сотрудника: {emp}</b>\n━━━━━━━━━━━━━━\n"
+      f"{bal_info}\n\n📋 <b>Реквизиты Kaspi:</b>\n<blockquote><code>{reqs}</code></blockquote>\n"
+      "<i>Выберите действие:</i>",
+      reply_markup=IMarkup(inline_keyboard=btns),
+      parse_mode="HTML",
+  )
+
+
+# --- ПОПОЛНЕНИЕ БАЛАНСА АВАНСОМ ---
+@dp.callback_query(F.data == "give_advance")
+async def cb_give_advance_start(c: types.CallbackQuery, state: FSMContext):
+  await c.answer()
+  d = await state.get_data()
+  await state.set_state(Form.advance_amount)
+  kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
+  await c.message.edit_text(
+      f"➕ <b>Выдача аванса сотруднику: {d['emp']}</b>\n━━━━━━━━━━━━━━\n"
+      f"Введите сумму выдаваемого аванса числом (например: <code>50000</code>):\n\n"
+      f"<i>Эта сумма запишется в таблицу и будет автоматически гаситься будущими чеками сотрудника.</i>",
       reply_markup=kb,
       parse_mode="HTML",
   )
 
 
+@dp.message(Form.advance_amount, F.text)
+async def process_advance_amount(m: types.Message, state: FSMContext):
+  try:
+    advance_val = float(m.text.replace(" ", "").replace(",", ".").strip())
+  except ValueError:
+    return await m.answer("⚠️ Введите корректную сумму числом (например: 50000):")
+
+  if advance_val <= 0:
+    return await m.answer("⚠️ Сумма аванса должна быть больше 0:")
+
+  d = await state.get_data()
+  emp = d["emp"]
+  await state.clear()
+
+  # Аванс вносится с отрицательной суммой в "Прочие расходы" со статусом "К возмещению"
+  now_str = now_astana().strftime("%d.%m.%Y")
+  await asyncio.to_thread(
+      add_operation_sync,
+      now_str,
+      "Прочие расходы",
+      -advance_val,
+      emp,
+      f"Аванс на баланс (выдал: {m.from_user.full_name or 'Администратор'})",
+      "К возмещению",
+  )
+
+  await m.answer(
+      f"✅ <b>Аванс успешно выдан!</b>\n━━━━━━━━━━━━━━\n"
+      f"👤 Сотрудник: <b>{emp}</b>\n"
+      f"🟢 Начислено на баланс: <b>+{advance_val:,.0f} ₸</b>\n\n"
+      f"<i>Будущие чеки и расходы сотрудника автоматически пойдут в зачет этого аванса.</i>",
+      reply_markup=IMarkup(inline_keyboard=[[IBtn(text="⬅️ В панель управления", callback_data="adm_back")]]),
+      parse_mode="HTML",
+  )
+
+
+# --- ПОЛНАЯ И ЧАСТИЧНАЯ ВЫПЛАТА ДОЛГА ---
 def settle_payout_sync(emp: str, paid: float, debt: float):
   ws = spreadsheet.worksheet("Операции")
   for idx, r in enumerate(ws.get_all_values()[1:], start=2):
@@ -1214,7 +1313,7 @@ def settle_payout_sync(emp: str, paid: float, debt: float):
   if abs(diff) > 0.01:
     amt = -diff if diff > 0 else abs(diff)
     note = (
-        f"Аванс на баланс (выплачено {paid:,.0f} при долге {debt:,.0f})"
+        f"Аванс / переплата (выплачено {paid:,.0f} при долге {debt:,.0f})"
         if diff > 0
         else f"Остаток долга (выплачено {paid:,.0f} из {debt:,.0f})"
     )
@@ -1223,11 +1322,11 @@ def settle_payout_sync(emp: str, paid: float, debt: float):
 
 @dp.callback_query(F.data == "pay_exact")
 async def cb_pay_exact(c: types.CallbackQuery, state: FSMContext):
-  await c.answer("Провожу выплату...")
+  await c.answer("Списываю долг...")
   d = await state.get_data()
   await state.clear()
   await asyncio.to_thread(settle_payout_sync, d["emp"], d["debt"], d["debt"])
-  await c.message.edit_text(f"✅ Выплата <b>{d['debt']:,.0f} ₸</b> для <b>{d['emp']}</b> закрыта!", parse_mode="HTML")
+  await c.message.edit_text(f"✅ Долг перед <b>{d['emp']}</b> на сумму <b>{d['debt']:,.0f} ₸</b> закрыт ровно в ноль!", parse_mode="HTML")
   await render_control_panel(c, c.from_user.id)
 
 
@@ -1238,9 +1337,9 @@ async def cb_pay_custom(c: types.CallbackQuery, state: FSMContext):
   await state.set_state(Form.custom_payout)
   kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
   await c.message.edit_text(
-      f"👤 <b>{d['emp']}</b> (долг: {d['debt']:,.0f} ₸)\n\n"
+      f"👤 <b>{d['emp']}</b> (текущий долг: {d['debt']:,.0f} ₸)\n\n"
       f"💸 <b>Введите фактически переведенную сумму:</b>\n"
-      f"<blockquote>Если сумма больше долга, разница перейдет в аванс.</blockquote>",
+      f"<blockquote>Если сумма превысит долг, остаток автоматически станет авансом.</blockquote>",
       reply_markup=kb,
       parse_mode="HTML",
   )
@@ -1249,9 +1348,9 @@ async def cb_pay_custom(c: types.CallbackQuery, state: FSMContext):
 @dp.message(Form.custom_payout, F.text)
 async def process_custom_pay(m: types.Message, state: FSMContext):
   try:
-    paid = float(m.text.replace(" ", "").replace(",", "."))
+    paid = float(m.text.replace(" ", "").replace(",", ".").strip())
   except ValueError:
-    return await m.answer("⚠️ Введите сумму числом:")
+    return await m.answer("⚠️ Введите число:")
 
   d = await state.get_data()
   await state.clear()
@@ -1285,7 +1384,7 @@ async def catch_requisites_input(m: types.Message):
 
 
 # =====================================================================
-# 10. ЗАПУСК
+# 10. ТОЧКА ВХОДА И ЗАПУСК
 # =====================================================================
 
 
