@@ -28,7 +28,7 @@ from google.genai import types as genai_types
 import gspread
 
 # =====================================================================
-# 1. КОНФИГУРАЦИЯ (ВСТРОЕНЫ ТАБЛИЦА И ПАПКА «ЧЕКИ»)
+# 1. КОНФИГУРАЦИЯ
 # =====================================================================
 
 load_dotenv()
@@ -79,7 +79,7 @@ MONTHS_RU = [
 ]
 
 NAV_BTNS = {
-    "⏱ Моя смена", "🍔 Запросить обед", "🚕 Такси",
+    "⏱ Моя смена", "🔴 Завершить смену", "🍔 Запросить обед", "🚕 Такси",
     "🧾 Прочие расходы", "💰 Мой баланс", "💳 Реквизиты", "⚙️ Управление",
 }
 
@@ -90,7 +90,7 @@ class Form(StatesGroup):
   meal_comment = State()
   fast_expense = State()
   custom_payout = State()
-  advance_amount = State()  # Состояние ввода суммы аванса
+  advance_amount = State()
 
 
 def now_astana() -> datetime:
@@ -111,8 +111,15 @@ def is_staff_lead(uid: int) -> bool:
   return uid in admins or uid in managers
 
 
+def parse_kzt(val: str) -> float:
+  try:
+    return float(re.sub(r'[^\d.-]', '', str(val).replace(",", ".")))
+  except ValueError:
+    return 0.0
+
+
 # =====================================================================
-# 2. ЗАГРУЗКА В ЦЕЛЕВУЮ ПАПКУ «ЧЕКИ» И ИИ
+# 2. ИИ И GOOGLE ДИСК
 # =====================================================================
 
 
@@ -170,7 +177,7 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =====================================================================
-# 3. ТАБЛИЦА: ВСЕ АККАУНТЫ, АВАНСЫ И ВЫПЛАТЫ
+# 3. ТАБЛИЦА
 # =====================================================================
 
 
@@ -210,7 +217,6 @@ def sync_roles_and_formulas():
 
 
 def get_all_team_members_sync():
-  """Возвращает всех сотрудников из таблицы и их текущий баланс"""
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     rows = ws_pay.get_all_values()[1:]
@@ -218,11 +224,7 @@ def get_all_team_members_sync():
     for r in rows:
       if r and r[0].strip():
         name = r[0].strip()
-        bal_str = str(r[3]).replace(" ", "").replace(",", ".").replace("₸", "") if len(r) > 3 else "0"
-        try:
-          bal = float(bal_str)
-        except ValueError:
-          bal = 0.0
+        bal = parse_kzt(r[3]) if len(r) > 3 else 0.0
         team.append((name, bal))
     return team
   except Exception as e:
@@ -297,16 +299,10 @@ def add_operation_sync(
 
   ws.append_row(
       [
-          tx,
-          calc_date,
-          period,
-          employee,
-          taxi_val,
-          meals_val,
-          other_val,
+          tx, calc_date, period, employee,
+          taxi_val, meals_val, other_val,
           f"=E{next_row}+F{next_row}+G{next_row}",
-          status,
-          check_cell,
+          status, check_cell,
       ],
       value_input_option="USER_ENTERED",
   )
@@ -323,10 +319,10 @@ def get_debts_sync(filter_emp: str = None):
     if not who:
       continue
 
-    taxi_amt = float(str(r[4]).replace(" ", "").replace(",", ".") or 0)
-    meal_amt = float(str(r[5]).replace(" ", "").replace(",", ".") or 0)
-    other_amt = float(str(r[6]).replace(" ", "").replace(",", ".") or 0)
-    total_row = float(str(r[7]).replace(" ", "").replace(",", ".") or 0) if len(r) > 7 and r[7] else (taxi_amt + meal_amt + other_amt)
+    taxi_amt = parse_kzt(r[4])
+    meal_amt = parse_kzt(r[5])
+    other_amt = parse_kzt(r[6])
+    total_row = parse_kzt(r[7]) if len(r) > 7 and str(r[7]).strip() else (taxi_amt + meal_amt + other_amt)
 
     debts[who] = debts.get(who, 0.0) + total_row
 
@@ -337,13 +333,14 @@ def get_debts_sync(filter_emp: str = None):
 
 
 # =====================================================================
-# 4. КЛАВИАТУРЫ И КАЛЕНДАРЬ
+# 4. ДИНАМИЧЕСКИЕ КЛАВИАТУРЫ И КАЛЕНДАРЬ
 # =====================================================================
 
 
 def main_kb(uid: int) -> RMarkup:
+  shift_btn = KBtn(text="🔴 Завершить смену") if uid in active_shifts else KBtn(text="⏱ Моя смена")
   kb = [
-      [KBtn(text="⏱ Моя смена"), KBtn(text="🍔 Запросить обед")],
+      [shift_btn, KBtn(text="🍔 Запросить обед")],
       [KBtn(text="🚕 Такси"), KBtn(text="🧾 Прочие расходы")],
       [KBtn(text="💰 Мой баланс"), KBtn(text="💳 Реквизиты")],
   ]
@@ -422,6 +419,8 @@ async def cancel_active_fsm_on_nav(m: types.Message, state: FSMContext):
   if m.text in NAV_BTNS:
     if m.text == "⏱ Моя смена":
       await msg_shift(m)
+    elif m.text == "🔴 Завершить смену":
+      await msg_end_shift_direct(m)
     elif m.text == "🍔 Запросить обед":
       await msg_meal_request(m)
     elif m.text == "🚕 Такси":
@@ -435,7 +434,7 @@ async def cancel_active_fsm_on_nav(m: types.Message, state: FSMContext):
     elif m.text == "⚙️ Управление":
       await cmd_panel(m)
     return
-  await m.answer("🔄 <b>Действие отменено.</b> Меню готово к работе!", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
+  await m.answer("🔄 <b>Действие отменено.</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "cancel_fsm_action")
@@ -443,7 +442,7 @@ async def cb_cancel_fsm_action(c: types.CallbackQuery, state: FSMContext):
   await c.answer("Отменено")
   await state.clear()
   waiting_reqs.discard(c.from_user.id)
-  await c.message.edit_text("❌ <b>Действие отменено.</b> Меню готово к работе.", parse_mode="HTML")
+  await c.message.edit_text("❌ <b>Действие отменено.</b>", parse_mode="HTML")
 
 
 @dp.message(CommandStart())
@@ -469,8 +468,6 @@ async def cmd_login(m: types.Message):
   if len(parts) > 1 and parts[1].strip() == ADMIN_PASSWORD:
     admins.add(m.from_user.id)
     await m.answer("🔓 <b>Права Главного Администратора активированы!</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
-  else:
-    await m.answer("⛔️ Неверный пароль. Формат: <code>/login пароль</code>", parse_mode="HTML")
 
 
 @dp.message(Command("manager"))
@@ -479,8 +476,6 @@ async def cmd_manager(m: types.Message):
   if len(parts) > 1 and parts[1].strip() == MANAGER_PASSWORD:
     managers.add(m.from_user.id)
     await m.answer("🔓 <b>Права Управляющего активированы!</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
-  else:
-    await m.answer("⛔️ Неверный пароль.")
 
 
 @dp.message(F.text == "💰 Мой баланс")
@@ -495,15 +490,18 @@ async def msg_balance(m: types.Message):
   meals_sum = sum(x["amount"] for x in items if x["cat"] == "Обеденные")
   other_sum = sum(x["amount"] for x in items if x["cat"] == "Прочие расходы")
 
-  status = f"💵 <b>К выплате вам: {total:,.0f} ₸</b>" if total > 0.01 else (
-      f"🟢 <b>Аванс на балансе: +{abs(total):,.0f} ₸</b>" if total < -0.01 else "✨ <b>Все расчеты закрыты (0 ₸)</b>"
-  )
+  if total > 0.01:
+    status = f"💵 <b>К выплате вам: {total:,.0f} ₸</b>"
+  elif total < -0.01:
+    status = f"🟢 <b>Подотчетный баланс (на расходы): +{abs(total):,.0f} ₸</b>"
+  else:
+    status = "✨ <b>Все расчеты закрыты (0 ₸)</b>"
 
   await wait.edit_text(
       f"👤 <b>Сотрудник: {name}</b>\n"
       f"📅 Период: <b>{cur_period}</b>\n━━━━━━━━━━━━━━\n"
       f"{status}\n\n"
-      f"📊 <b>Ваши подтвержденные расходы:</b>\n"
+      f"📊 <b>Ваши расходы в таблице (к возмещению):</b>\n"
       f"• 🚕 Такси: <b>{taxi_sum:,.0f} ₸</b>\n"
       f"• 🍔 Обеды: <b>{meals_sum:,.0f} ₸</b>\n"
       f"• 🧾 Прочее: <b>{other_sum:,.0f} ₸</b>",
@@ -514,19 +512,16 @@ async def msg_balance(m: types.Message):
 @dp.message(F.text == "💳 Реквизиты")
 async def msg_reqs(m: types.Message):
   name = await get_emp(m.from_user)
-
   def read_req():
     for r in spreadsheet.worksheet("Выплаты команде").get_all_values()[1:]:
       if len(r) >= 3 and r[0].strip().lower() == name.lower():
         return r[2].strip().lstrip("'") if r[2].strip() not in ["-", ""] else "Не указаны"
     return "Не указаны"
-
   reqs = await asyncio.to_thread(read_req)
   kb = IMarkup(inline_keyboard=[[IBtn(text="✏️ Изменить реквизиты", callback_data="edit_reqs")]])
   await m.answer(
       f"💳 <b>Реквизиты для выплат</b>\n━━━━━━━━━━━━━━\n👤 <b>{name}</b>\n<blockquote><code>{reqs}</code></blockquote>",
-      reply_markup=kb,
-      parse_mode="HTML",
+      reply_markup=kb, parse_mode="HTML",
   )
 
 
@@ -539,7 +534,7 @@ async def cb_edit_reqs(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 6. СМЕНЫ С КОММЕНТАРИЕМ И 6-ЧАСОВЫМ ТАЙМЕРОМ
+# 6. СМЕНЫ С КОММЕНТАРИЕМ И ПРЯМАЯ КНОПКА ЗАВЕРШЕНИЯ
 # =====================================================================
 
 
@@ -571,21 +566,16 @@ async def shift_timer_loop():
             txt = await finish_shift(uid, end_dt=s["prompt_at"], auto=True)
             if txt:
               try:
-                await bot.send_message(uid, txt, parse_mode="HTML")
+                await bot.send_message(uid, txt, reply_markup=main_kb(uid), parse_mode="HTML")
               except Exception:
                 pass
-              for aid in admins:
-                try:
-                  await bot.send_message(aid, f"ℹ️ <b>Автозакрытие:</b> {s['emp']} не ответил на 6ч таймер ({s['date']}).", parse_mode="HTML")
-                except Exception:
-                  pass
         elif now >= s["next_check"]:
           s["waiting"] = True
           s["prompt_at"] = now
           hrs = int((now - s["start"]).total_seconds() // 3600)
           kb = IMarkup(inline_keyboard=[
               [IBtn(text="🟢 Продолжаю работать (+6 ч)", callback_data="shift_extend")],
-              [IBtn(text="🔴 Завершить смену", callback_data="shift_end")],
+              [IBtn(text="🔴 Завершить смену", callback_data="shift_end_inline")],
           ])
           try:
             await bot.send_message(
@@ -602,6 +592,25 @@ async def shift_timer_loop():
     await asyncio.sleep(60)
 
 
+@dp.message(F.text == "🔴 Завершить смену")
+async def msg_end_shift_direct(m: types.Message):
+  uid = m.from_user.id
+  if uid not in active_shifts:
+    return await m.answer("У вас нет активной смены.", reply_markup=main_kb(uid))
+  
+  txt = await finish_shift(uid, end_dt=now_astana(), auto=False)
+  await m.answer(txt or "Смена уже завершена.", reply_markup=main_kb(uid), parse_mode="HTML")
+
+
+@dp.callback_query(F.data == "shift_end_inline")
+async def cb_shift_end_inline(c: types.CallbackQuery):
+  await c.answer()
+  uid = c.from_user.id
+  txt = await finish_shift(uid, end_dt=now_astana(), auto=False)
+  await c.message.edit_text(txt or "Смена уже завершена.", parse_mode="HTML")
+  await bot.send_message(uid, "✅ <b>Меню обновлено.</b>", reply_markup=main_kb(uid), parse_mode="HTML")
+
+
 @dp.message(F.text == "⏱ Моя смена")
 async def msg_shift(m: types.Message):
   uid = m.from_user.id
@@ -615,7 +624,7 @@ async def msg_shift(m: types.Message):
     s = active_shifts[uid]
     dur = now_astana() - s["start"]
     h, mn = int(dur.total_seconds() // 3600), int((dur.total_seconds() % 3600) // 60)
-    btns = [[IBtn(text="🔴 Завершить смену", callback_data="shift_end")]]
+    btns = [[IBtn(text="🔴 Завершить смену", callback_data="shift_end_inline")]]
     if s.get("waiting"):
       btns.insert(0, [IBtn(text="🟢 Продлить смену (+6 ч)", callback_data="shift_extend")])
     await m.answer(
@@ -646,13 +655,6 @@ async def cb_shift_extend(c: types.CallbackQuery):
   s["waiting"] = False
   s["next_check"] = now_astana() + timedelta(hours=SHIFT_INTERVAL_H)
   await c.message.edit_text(f"✅ <b>Смена продлена!</b>\nСледующая проверка в {s['next_check'].strftime('%H:%M')}.", parse_mode="HTML")
-
-
-@dp.callback_query(F.data == "shift_end")
-async def cb_shift_end(c: types.CallbackQuery):
-  await c.answer()
-  txt = await finish_shift(c.from_user.id, end_dt=now_astana(), auto=False)
-  await c.message.edit_text(txt or "Смена уже завершена.", parse_mode="HTML")
 
 
 @dp.message(Form.shift_comment, F.text)
@@ -707,8 +709,7 @@ async def process_retro_time(m: types.Message, state: FSMContext):
           aid,
           f"⚠️ <b>Запрос смены задним числом</b>\n━━━━━━━━━━━━━━\n"
           f"👤 Сотрудник: <b>{emp}</b>\n📅 Дата: {data['date']}\n🕒 Старт: <b>{target.strftime('%H:%M')}</b>",
-          reply_markup=kb,
-          parse_mode="HTML",
+          reply_markup=kb, parse_mode="HTML",
       )
     except Exception:
       pass
@@ -726,14 +727,21 @@ async def cb_retro_decision(c: types.CallbackQuery):
     return await c.message.edit_text("Запрос уже обработан.")
 
   if act == "s_appr":
+    start_time = req["start"]
+    now = now_astana()
+    
+    elapsed_h = max(0, (now - start_time).total_seconds()) / 3600.0
+    blocks = (int(elapsed_h // SHIFT_INTERVAL_H) + 1) * SHIFT_INTERVAL_H
+    next_check = start_time + timedelta(hours=blocks)
+
     active_shifts[req["uid"]] = {
-        "date": req["date"], "start": req["start"], "emp": req["emp"],
-        "comment": req["comment"], "next_check": now_astana() + timedelta(hours=SHIFT_INTERVAL_H),
+        "date": req["date"], "start": start_time, "emp": req["emp"],
+        "comment": req["comment"], "next_check": next_check,
         "waiting": False, "prompt_at": None,
     }
-    await c.message.edit_text(f"✅ Смена <b>{req['emp']}</b> одобрена с {req['start'].strftime('%H:%M')}!", parse_mode="HTML")
+    await c.message.edit_text(f"✅ Смена <b>{req['emp']}</b> одобрена с {start_time.strftime('%H:%M')}!", parse_mode="HTML")
     try:
-      await bot.send_message(req["uid"], f"✅ <b>Администратор одобрил смену!</b>\n📅 {req['date']} ({req['start'].strftime('%H:%M')})", parse_mode="HTML")
+      await bot.send_message(req["uid"], f"✅ <b>Администратор одобрил смену!</b>\n📅 {req['date']} ({start_time.strftime('%H:%M')})", reply_markup=main_kb(req["uid"]), parse_mode="HTML")
     except Exception:
       pass
   else:
@@ -753,8 +761,7 @@ async def cb_retro_decision(c: types.CallbackQuery):
 async def msg_meal_request(m: types.Message):
   await m.answer(
       "🍔 <b>Запрос на обеденные (2 500 ₸)</b>\nВыберите дату смены, за которую запрашиваете обед:",
-      reply_markup=date_picker_kb("req_meal"),
-      parse_mode="HTML",
+      reply_markup=date_picker_kb("req_meal"), parse_mode="HTML",
   )
 
 
@@ -764,12 +771,8 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
   await state.clear()
   emp = await get_emp(m.from_user)
   mid = f"ML-{random.randint(1000, 9999)}"
-
   pending_meal_requests[mid] = {
-      "uid": m.from_user.id,
-      "date": data["date"],
-      "emp": emp,
-      "comment": m.text.strip(),
+      "uid": m.from_user.id, "date": data["date"], "emp": emp, "comment": m.text.strip(),
   }
 
   kb = IMarkup(inline_keyboard=[[
@@ -781,16 +784,13 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
       await bot.send_message(
           lid,
           f"🍔 <b>Запрос на обеденные (2 500 ₸)</b>\n━━━━━━━━━━━━━━\n"
-          f"👤 Сотрудник: <b>{emp}</b>\n"
-          f"📅 Дата: <b>{data['date']}</b>\n"
+          f"👤 Сотрудник: <b>{emp}</b>\n📅 Дата: <b>{data['date']}</b>\n"
           f"📝 Примечание: <i>{m.text.strip()}</i>\n\nОдобрить начисление?",
-          reply_markup=kb,
-          parse_mode="HTML",
+          reply_markup=kb, parse_mode="HTML",
       )
     except Exception:
       pass
-
-  await m.answer(f"⏳ <b>Запрос отправлен управляющему!</b>\n📅 Дата: {data['date']}\nПосле подтверждения 2 500 ₸ добавятся в баланс.", parse_mode="HTML")
+  await m.answer(f"⏳ <b>Запрос отправлен управляющему!</b>\n📅 Дата: {data['date']}", parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith(("ml_ok|", "ml_no|")))
@@ -807,28 +807,24 @@ async def cb_meal_decision(c: types.CallbackQuery):
     approver = c.from_user.full_name or "Управляющий"
     await asyncio.to_thread(
         add_operation_sync,
-        req["date"],
-        "Обеденные",
-        2500,
-        req["emp"],
-        f"{req['comment']} (Одобрил: {approver})",
-        "К возмещению",
+        req["date"], "Обеденные", 2500, req["emp"],
+        f"{req['comment']} (Одобрил: {approver})", "К возмещению",
     )
-    await c.message.edit_text(f"✅ Обед для <b>{req['emp']}</b> (2 500 ₸) одобрен и зачислен в таблицу!", parse_mode="HTML")
+    await c.message.edit_text(f"✅ Обед для <b>{req['emp']}</b> (2 500 ₸) одобрен и зачислен!", parse_mode="HTML")
     try:
-      await bot.send_message(req["uid"], f"✅ <b>Ваш обед (2 500 ₸) за {req['date']} одобрен!</b> Сумма добавлена в баланс.", parse_mode="HTML")
+      await bot.send_message(req["uid"], f"✅ <b>Ваш обед (2 500 ₸) за {req['date']} одобрен!</b>", parse_mode="HTML")
     except Exception:
       pass
   else:
     await c.message.edit_text(f"❌ Запрос обеда для <b>{req['emp']}</b> отклонен.", parse_mode="HTML")
     try:
-      await bot.send_message(req["uid"], f"❌ Запрос на обеденные за {req['date']} отклонен управляющим.", parse_mode="HTML")
+      await bot.send_message(req["uid"], f"❌ Запрос на обеденные за {req['date']} отклонен.", parse_mode="HTML")
     except Exception:
       pass
 
 
 # =====================================================================
-# 8. ТАКСИ, ЧЕКИ И МАРШРУТИЗАЦИЯ
+# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ И МАРШРУТИЗАЦИЯ
 # =====================================================================
 
 
@@ -838,9 +834,7 @@ async def msg_taxi_prompt(m: types.Message):
   night = now.hour >= 22 or now.hour < 7
   mode_txt = "🌙 Ночной тариф (22:00–07:00) — начисление сразу!" if night else "☀️ Дневной тариф — через согласование."
   await m.answer(
-      f"🚕 <b>Учет поездок на такси</b>\n━━━━━━━━━━━━━━\n"
-      f"Отправьте скриншот поездки из Яндекс Go в этот чат.\n"
-      f"<blockquote>{mode_txt}</blockquote>",
+      f"🚕 <b>Учет поездок на такси</b>\n━━━━━━━━━━━━━━\nОтправьте скриншот поездки из Яндекс Go.\n<blockquote>{mode_txt}</blockquote>",
       parse_mode="HTML",
   )
 
@@ -848,13 +842,13 @@ async def msg_taxi_prompt(m: types.Message):
 @dp.message(F.text == "🧾 Прочие расходы")
 async def msg_other_expenses_prompt(m: types.Message):
   await m.answer(
-      "🧾 <b>Прочие расходы (закупки, расходники, субаренда)</b>\n━━━━━━━━━━━━━━\n"
-      "Отправьте фото чека в этот чат. Бот автоматически сохранит его в папку «Чеки» на Диске и внесет в таблицу.",
+      "🧾 <b>Прочие расходы</b>\n━━━━━━━━━━━━━━\nОтправьте фото чека в этот чат. Бот внесет его в таблицу.",
       parse_mode="HTML",
   )
 
 
-@dp.message(F.photo)
+# Обработчик фото-чеков для ОБЫЧНЫХ расходов (с фильтром StateFilter(None))
+@dp.message(StateFilter(None), F.photo)
 async def handle_receipt_photo(m: types.Message):
   photo = m.photo[-1]
   if photo.file_unique_id in saved_files:
@@ -901,8 +895,7 @@ async def handle_receipt_photo(m: types.Message):
       f"📂 Категория: <b>{pending_receipts[m.from_user.id]['category']}</b>\n"
       f"🏪 Поставщик: <i>{merch} ({desc})</i>{badge}\n\n"
       f"📅 <b>Выберите дату расхода:</b>",
-      reply_markup=date_picker_kb("check"),
-      parse_mode="HTML",
+      reply_markup=date_picker_kb("check"), parse_mode="HTML",
   )
 
 
@@ -917,10 +910,8 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.meal_comment)
     kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
     await c.message.edit_text(
-        f"📅 Дата: <b>{label}</b>\n\n📝 <b>Напишите комментарий к запросу:</b>\n"
-        f"<blockquote>Например: <code>Монтаж сцены левый берег</code></blockquote>",
-        reply_markup=kb,
-        parse_mode="HTML",
+        f"📅 Дата: <b>{label}</b>\n\n📝 <b>Напишите комментарий к запросу:</b>",
+        reply_markup=kb, parse_mode="HTML",
     )
 
   elif act == "s_now":
@@ -928,10 +919,8 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.shift_comment)
     kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
     await c.message.edit_text(
-        f"📅 Дата: <b>{label}</b>\n\n📝 <b>Укажите короткий комментарий к смене:</b>\n"
-        f"<blockquote>Например: <code>Склад разгрузка</code> или <code>Концертный зал</code></blockquote>",
-        reply_markup=kb,
-        parse_mode="HTML",
+        f"📅 Дата: <b>{label}</b>\n\n📝 <b>Укажите короткий комментарий к смене:</b>",
+        reply_markup=kb, parse_mode="HTML",
     )
 
   elif act == "s_retro":
@@ -939,10 +928,8 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.retro_time)
     kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
     await c.message.edit_text(
-        f"📅 Дата: <b>{label}</b>\n\n🕒 <b>Во сколько фактически началась смена?</b>\n"
-        f"<blockquote>Пример: <code>14:00</code> или <code>2 часа назад</code></blockquote>",
-        reply_markup=kb,
-        parse_mode="HTML",
+        f"📅 Дата: <b>{label}</b>\n\n🕒 <b>Во сколько фактически началась смена?</b>",
+        reply_markup=kb, parse_mode="HTML",
     )
 
   elif act == "check":
@@ -971,14 +958,12 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
               lid,
               f"🚕 <b>Дневное такси на согласовании</b>\n━━━━━━━━━━━━━━\n"
               f"👤 Сотрудник: <b>{rec['emp']}</b>\n💵 Сумма: <b>{rec['amount']:,.0f} ₸</b>\n📅 Дата: {label}",
-              reply_markup=kb,
-              parse_mode="HTML",
+              reply_markup=kb, parse_mode="HTML",
           )
         except Exception:
           pass
       return await c.message.edit_text(
-          f"⏳ <b>Дневное такси отправлено на согласование!</b>\n📅 {label} — <b>{rec['amount']:,.0f} ₸</b>",
-          parse_mode="HTML",
+          f"⏳ <b>Дневное такси отправлено на согласование!</b>\n📅 {label} — <b>{rec['amount']:,.0f} ₸</b>", parse_mode="HTML",
       )
 
     await asyncio.to_thread(
@@ -1000,10 +985,11 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.fast_expense)
     kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
     await c.message.edit_text(
-        f"📅 Дата: <b>{label}</b>\n\n✍️ <b>Напишите сумму и описание одной строкой:</b>\n"
-        f"<blockquote>• <code>75000 субаренда</code> (с кассы ИП)\n• <code>15000 газель лично</code> (к возмещению вам)</blockquote>",
-        reply_markup=kb,
-        parse_mode="HTML",
+        f"📅 Дата: <b>{label}</b>\n\n"
+        f"📸 <b>Отправьте ФОТО чека</b> (сумму и описание можно указать в подписи)\n"
+        f"✍️ ИЛИ напишите расход <b>просто текстом</b>\n\n"
+        f"<blockquote>По умолчанию расход спишется со счета Кассы/ИП.\nЕсли платили из своих, добавьте слово «свои».</blockquote>",
+        reply_markup=kb, parse_mode="HTML",
     )
 
 
@@ -1029,13 +1015,13 @@ async def cb_taxi_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 9. ПАНЕЛЬ УПРАВЛЕНИЯ, ВСЕ АККАУНТЫ, ВЫПЛАТЫ И АВАНСЫ
+# 9. ПАНЕЛЬ УПРАВЛЕНИЯ, ВСЕ АККАУНТЫ, ВЫПЛАТЫ И ПОДОТЧЕТ
 # =====================================================================
 
 
 async def render_control_panel(target, uid: int):
   btns = [
-      [IBtn(text="⚡️ Внести быстрый расход", callback_data="adm_fast")],
+      [IBtn(text="⚡️ Внести расход (Фото / Текст)", callback_data="adm_fast")],
       [IBtn(text=f"⏱ Смены онлайн ({len(active_shifts)})", callback_data="adm_shifts")],
   ]
   cur_period = get_pay_period(now_astana())
@@ -1096,6 +1082,53 @@ async def cb_adm_fast(c: types.CallbackQuery):
   await c.message.edit_text("⚡️ <b>Выберите дату расхода:</b>", reply_markup=date_picker_kb("fastexp"), parse_mode="HTML")
 
 
+# --- ОБРАБОТЧИК ФОТО ЧЕКА ОТ УПРАВЛЯЮЩЕГО ---
+@dp.message(Form.fast_expense, F.photo)
+async def process_fast_expense_photo(m: types.Message, state: FSMContext):
+  d = await state.get_data()
+  await state.clear()
+  wait = await m.answer("🔍 <b>Сканирую чек управляющего и сохраняю на Диск...</b>", parse_mode="HTML")
+
+  photo = m.photo[-1]
+  buf = io.BytesIO()
+  await bot.download(photo, destination=buf)
+  img_bytes = buf.getvalue()
+
+  fname = f"admin_check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
+  drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
+
+  caption = m.caption or ""
+  prompt_addon = f' Учти комментарий управляющего: "{caption}".' if caption else ""
+  prompt = (
+      'Изучи чек.' + prompt_addon + ' Верни ТОЛЬКО JSON: '
+      '{"amount": число, "category": "Такси" | "Прочие расходы", '
+      '"desc": "суть/название", "personal": true если написано лично/свои иначе false}'
+  )
+
+  res = await ask_gemini([genai_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), prompt])
+  if not res:
+    res = {"amount": 0, "category": "Прочие расходы", "desc": caption or "Чек кассы", "personal": False}
+
+  amt = float(res.get("amount", 0))
+  personal = res.get("personal", False)
+  payer = await get_emp(m.from_user) if personal else "Касса / ИП"
+  st = "К возмещению" if personal else "Не требуется"
+
+  await asyncio.to_thread(
+      add_operation_sync,
+      d["date"], res.get("category", "Прочие расходы"), amt, payer,
+      res.get("desc", caption or "Чек кассы"), st, drive_url
+  )
+
+  await wait.edit_text(
+      f"✅ <b>Расход внесен с чеком!</b>\n━━━━━━━━━━━━━━\n"
+      f"📅 {d['date']} | 💵 <b>{amt:,.0f} ₸</b>\n📂 {res.get('category')} ({payer})\n📁 <i>Файл сохранен в папку «Чеки» на Диске.</i>",
+      reply_markup=IMarkup(inline_keyboard=[[IBtn(text="⬅️ В панель", callback_data="adm_back")]]),
+      parse_mode="HTML",
+  )
+
+
+# --- ОБРАБОТЧИК ТЕКСТА ОТ УПРАВЛЯЮЩЕГО ---
 @dp.message(Form.fast_expense, F.text)
 async def process_fast_expense(m: types.Message, state: FSMContext):
   d = await state.get_data()
@@ -1161,7 +1194,6 @@ async def cb_adm_roles(c: types.CallbackQuery):
 async def cb_toggle_role(c: types.CallbackQuery):
   await c.answer()
   prefix = c.data.split("|")[1]
-
   def toggle():
     ws = spreadsheet.worksheet("Выплаты команде")
     for idx, r in enumerate(ws.get_all_values()[1:], start=2):
@@ -1170,12 +1202,11 @@ async def cb_toggle_role(c: types.CallbackQuery):
         ws.update_cell(idx, 2, "Команда" if "управл" in cur else "Управляющий")
         break
     sync_roles_and_formulas()
-
   await asyncio.to_thread(toggle)
   await cb_adm_roles(c)
 
 
-# --- ПОКАЗ ВСЕХ АККАУНТОВ КОМАНДЫ (С АВАНСАМИ И ДОЛГАМИ) ---
+# --- ПОКАЗ ВСЕХ АККАУНТОВ КОМАНДЫ ---
 @dp.callback_query(F.data == "adm_paylist")
 async def cb_adm_paylist(c: types.CallbackQuery):
   await c.answer()
@@ -1190,11 +1221,11 @@ async def cb_adm_paylist(c: types.CallbackQuery):
       status_txt = f"🔴 <b>{emp}</b>: <b>{bal:,.0f} ₸</b> (долг компании)"
       btn_txt = f"💸 Выплатить: {emp} ({bal:,.0f} ₸)"
     elif bal < 0:
-      status_txt = f"🟢 <b>{emp}</b>: <b>+{abs(bal):,.0f} ₸</b> (аванс)"
-      btn_txt = f"➕ Добавить аванс: {emp}"
+      status_txt = f"🟢 <b>{emp}</b>: <b>+{abs(bal):,.0f} ₸</b> (подотчет)"
+      btn_txt = f"➕ Выдать подотчет: {emp}"
     else:
       status_txt = f"⚪️ <b>{emp}</b>: <b>0 ₸</b> (расчетов нет)"
-      btn_txt = f"➕ Выдать аванс: {emp}"
+      btn_txt = f"➕ Выдать подотчет: {emp}"
 
     lines.append(status_txt)
     kb.append([IBtn(text=btn_txt, callback_data=f"pay|{emp[:20]}")])
@@ -1204,7 +1235,7 @@ async def cb_adm_paylist(c: types.CallbackQuery):
   await c.message.edit_text(
       f"💸 <b>Взаиморасчеты со всеми сотрудниками</b>\n"
       f"📅 Текущий период: <b>{cur_period}</b>\n━━━━━━━━━━━━━━\n"
-      f"{body}\n\n<i>Нажмите на сотрудника, чтобы провести выплату или пополнить баланс авансом:</i>",
+      f"{body}\n\n<i>Нажмите на сотрудника, чтобы провести выплату или выдать деньги на расходы:</i>",
       reply_markup=IMarkup(inline_keyboard=kb),
       parse_mode="HTML",
   )
@@ -1232,13 +1263,13 @@ async def cb_pay_prep(c: types.CallbackQuery, state: FSMContext):
     btns.append([IBtn(text=f"✅ Погасить долг ровно ({bal:,.0f} ₸)", callback_data="pay_exact")])
     btns.append([IBtn(text="✏️ Частичная выплата / с переплатой", callback_data="pay_custom")])
 
-  btns.append([IBtn(text="🟢 ➕ Пополнить баланс авансом", callback_data="give_advance")])
+  btns.append([IBtn(text="🟢 ➕ Пополнить подотчетный баланс", callback_data="give_advance")])
   btns.append([IBtn(text="⬅️ Назад к списку", callback_data="adm_paylist")])
 
   bal_info = (
       f"💵 <b>Текущий долг к выплате:</b> <code>{bal:,.0f} ₸</code>"
       if bal > 0
-      else (f"🟢 <b>Аванс на балансе:</b> <code>+{abs(bal):,.0f} ₸</code>" if bal < 0 else "⚪️ <b>Баланс нулевой (0 ₸)</b>")
+      else (f"🟢 <b>Подотчетный баланс:</b> <code>+{abs(bal):,.0f} ₸</code>" if bal < 0 else "⚪️ <b>Баланс нулевой (0 ₸)</b>")
   )
 
   await c.message.edit_text(
@@ -1250,7 +1281,7 @@ async def cb_pay_prep(c: types.CallbackQuery, state: FSMContext):
   )
 
 
-# --- ПОПОЛНЕНИЕ БАЛАНСА АВАНСОМ ---
+# --- ВЫДАЧА РАБОЧИХ (ПОДОТЧЕТНЫХ) СРЕДСТВ ---
 @dp.callback_query(F.data == "give_advance")
 async def cb_give_advance_start(c: types.CallbackQuery, state: FSMContext):
   await c.answer()
@@ -1258,11 +1289,10 @@ async def cb_give_advance_start(c: types.CallbackQuery, state: FSMContext):
   await state.set_state(Form.advance_amount)
   kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
   await c.message.edit_text(
-      f"➕ <b>Выдача аванса сотруднику: {d['emp']}</b>\n━━━━━━━━━━━━━━\n"
-      f"Введите сумму выдаваемого аванса числом (например: <code>50000</code>):\n\n"
-      f"<i>Эта сумма запишется в таблицу и будет автоматически гаситься будущими чеками сотрудника.</i>",
-      reply_markup=kb,
-      parse_mode="HTML",
+      f"➕ <b>Выдача средств на расходы (подотчет): {d['emp']}</b>\n━━━━━━━━━━━━━━\n"
+      f"Введите сумму числом (например: <code>50000</code>):\n\n"
+      f"<i>Эти деньги будут списываться автоматически, когда сотрудник будет присылать чеки в бота.</i>",
+      reply_markup=kb, parse_mode="HTML",
   )
 
 
@@ -1274,29 +1304,25 @@ async def process_advance_amount(m: types.Message, state: FSMContext):
     return await m.answer("⚠️ Введите корректную сумму числом (например: 50000):")
 
   if advance_val <= 0:
-    return await m.answer("⚠️ Сумма аванса должна быть больше 0:")
+    return await m.answer("⚠️ Сумма выдачи должна быть больше 0:")
 
   d = await state.get_data()
   emp = d["emp"]
   await state.clear()
 
-  # Аванс вносится с отрицательной суммой в "Прочие расходы" со статусом "К возмещению"
   now_str = now_astana().strftime("%d.%m.%Y")
   await asyncio.to_thread(
       add_operation_sync,
-      now_str,
-      "Прочие расходы",
-      -advance_val,
-      emp,
-      f"Аванс на баланс (выдал: {m.from_user.full_name or 'Администратор'})",
+      now_str, "Прочие расходы", -advance_val, emp,
+      f"Средства на расходы (выдал: {m.from_user.full_name or 'Администратор'})",
       "К возмещению",
   )
 
   await m.answer(
-      f"✅ <b>Аванс успешно выдан!</b>\n━━━━━━━━━━━━━━\n"
+      f"✅ <b>Средства выданы!</b>\n━━━━━━━━━━━━━━\n"
       f"👤 Сотрудник: <b>{emp}</b>\n"
-      f"🟢 Начислено на баланс: <b>+{advance_val:,.0f} ₸</b>\n\n"
-      f"<i>Будущие чеки и расходы сотрудника автоматически пойдут в зачет этого аванса.</i>",
+      f"🟢 Подотчетный баланс: <b>+{advance_val:,.0f} ₸</b>\n\n"
+      f"<i>Загруженные чеки автоматически погасят эту сумму.</i>",
       reply_markup=IMarkup(inline_keyboard=[[IBtn(text="⬅️ В панель управления", callback_data="adm_back")]]),
       parse_mode="HTML",
   )
@@ -1313,9 +1339,8 @@ def settle_payout_sync(emp: str, paid: float, debt: float):
   if abs(diff) > 0.01:
     amt = -diff if diff > 0 else abs(diff)
     note = (
-        f"Аванс / переплата (выплачено {paid:,.0f} при долге {debt:,.0f})"
-        if diff > 0
-        else f"Остаток долга (выплачено {paid:,.0f} из {debt:,.0f})"
+        f"Подотчет / переплата (выплачено {paid:,.0f} при долге {debt:,.0f})"
+        if diff > 0 else f"Остаток долга (выплачено {paid:,.0f} из {debt:,.0f})"
     )
     add_operation_sync(now_astana().strftime("%d.%m.%Y"), "Прочие расходы", amt, emp, note, "К возмещению")
 
@@ -1337,11 +1362,10 @@ async def cb_pay_custom(c: types.CallbackQuery, state: FSMContext):
   await state.set_state(Form.custom_payout)
   kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
   await c.message.edit_text(
-      f"👤 <b>{d['emp']}</b> (текущий долг: {d['debt']:,.0f} ₸)\n\n"
+      f"👤 <b>{d['emp']}</b> (теку долг: {d['debt']:,.0f} ₸)\n\n"
       f"💸 <b>Введите фактически переведенную сумму:</b>\n"
-      f"<blockquote>Если сумма превысит долг, остаток автоматически станет авансом.</blockquote>",
-      reply_markup=kb,
-      parse_mode="HTML",
+      f"<blockquote>Если сумма превысит долг, остаток автоматически станет подотчетным балансом.</blockquote>",
+      reply_markup=kb, parse_mode="HTML",
   )
 
 
@@ -1356,7 +1380,7 @@ async def process_custom_pay(m: types.Message, state: FSMContext):
   await state.clear()
   await asyncio.to_thread(settle_payout_sync, d["emp"], paid, d["debt"])
   diff = paid - d["debt"]
-  extra = f"\n🟢 Аванс на баланс: <b>+{diff:,.0f} ₸</b>" if diff > 0 else (f"\n⚠️ Остаток долга: <b>{abs(diff):,.0f} ₸</b>" if diff < 0 else "")
+  extra = f"\n🟢 Подотчетный баланс: <b>+{diff:,.0f} ₸</b>" if diff > 0 else (f"\n⚠️ Остаток долга: <b>{abs(diff):,.0f} ₸</b>" if diff < 0 else "")
   await m.answer(
       f"✅ <b>Выплата проведена!</b>\n👤 {d['emp']} | Переведено: <b>{paid:,.0f} ₸</b>{extra}",
       reply_markup=IMarkup(inline_keyboard=[[IBtn(text="⬅️ В панель", callback_data="adm_back")]]),
