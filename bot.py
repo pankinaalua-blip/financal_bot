@@ -28,24 +28,28 @@ from google.genai import types as genai_types
 import gspread
 
 # =====================================================================
-# 1. КОНФИГУРАЦИЯ
+# 1. КОНФИГУРАЦИЯ (АВТОНОМНЫЙ РЕЖИМ — НИЧЕГО МЕНЯТЬ В RENDER НЕ НУЖНО)
 # =====================================================================
 
 load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
-RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "").strip()
+# Используем конструкцию `or`, чтобы даже при пустой переменной в Render бралось встроенное значение
+SPREADSHEET_ID = (
+    os.getenv("SPREADSHEET_ID") or "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA"
+).strip()
+RECEIPTS_FOLDER_ID = (
+    os.getenv("RECEIPTS_FOLDER_ID") or "13ze6D8nDnjGtZ7QDOQAr5iZnyrVnLcEH"
+).strip()
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "disa2026").strip()
-MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "disa_manager").strip()
+ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or "disa2026").strip()
+MANAGER_PASSWORD = (os.getenv("MANAGER_PASSWORD") or "disa_manager").strip()
 
-# Доступ к финансам имеют ТОЛЬКО ID из ADMIN_IDS (например: 1642599250,5619982112)
+# Финансовый доступ строго у прописанных по ID администраторов
+RAW_ADMINS = os.getenv("ADMIN_IDS") or "1642599250,5619982112"
 INITIAL_ADMINS = [
-    int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "1642599250,5619982112").split(",")
-    if x.strip().isdigit()
+    int(x.strip()) for x in RAW_ADMINS.split(",") if x.strip().isdigit()
 ]
 
 TZ_ASTANA = ZoneInfo("Asia/Almaty")
@@ -192,11 +196,12 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =====================================================================
-# 3. СИНХРОНИЗАЦИЯ И ОПЕРАЦИИ С ТАБЛИЦЕЙ
+# 3. БЫСТРАЯ ПАКЕТНАЯ СИНХРОНИЗАЦИЯ И ОПЕРАЦИИ С ТАБЛИЦЕЙ
 # =====================================================================
 
 
 def sync_roles_and_formulas():
+  """Обновляет все формулы за 1 пакетный запрос без превышения квот Google API"""
   try:
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     pay_rows = ws_pay.get_all_values()
@@ -205,23 +210,32 @@ def sync_roles_and_formulas():
 
     mgr_names = set()
     cur_period = get_pay_period(now_astana())
+    batch_data = []
 
     for idx, row in enumerate(pay_rows[1:], start=2):
       if not row or not row[0].strip():
         continue
       name = row[0].strip()
       role = row[1].strip().lower() if len(row) > 1 else ""
-      # Из таблицы подтягиваются ТОЛЬКО управляющие (для смен). Админы задаются строго по ID.
+      # Из таблицы подтягиваются только управляющие (для контроля смен)
       if any(w in role for w in ["управл", "менедж", "manager"]):
         mgr_names.add(name.lower())
 
-      ws_pay.update_cell(idx, 4, f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "К возмещению")')
-      ws_pay.update_cell(idx, 5, f'=SUMIFS(Операции!E:E; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")')
-      ws_pay.update_cell(idx, 6, f'=SUMIFS(Операции!F:F; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")')
-      ws_pay.update_cell(idx, 7, f'=SUMIFS(Операции!G:G; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")')
-      ws_pay.update_cell(idx, 8, f"=E{idx}+F{idx}+G{idx}")
-      ws_pay.update_cell(idx, 9, f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "Выплачено")')
-      ws_pay.update_cell(idx, 10, cur_period)
+      batch_data.append({
+          "range": f"D{idx}:J{idx}",
+          "values": [[
+              f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "К возмещению")',
+              f'=SUMIFS(Операции!E:E; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")',
+              f'=SUMIFS(Операции!F:F; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")',
+              f'=SUMIFS(Операции!G:G; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")',
+              f"=E{idx}+F{idx}+G{idx}",
+              f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "Выплачено")',
+              cur_period,
+          ]],
+      })
+
+    if batch_data:
+      ws_pay.batch_update(batch_data, value_input_option="USER_ENTERED")
 
     managers.clear()
     for r in ref_rows:
@@ -804,7 +818,6 @@ async def process_retro_comment(m: types.Message, state: FSMContext):
       IBtn(text="✅ Одобрить", callback_data=f"s_appr|{rid}"),
       IBtn(text="❌ Отклонить", callback_data=f"s_rej|{rid}"),
   ]])
-  # Одобрять смены могут и админы, и управляющие
   for lid in admins | managers:
     try:
       await bot.send_message(
@@ -1152,7 +1165,6 @@ async def render_control_panel(target, uid: int):
         [IBtn(text="👥 Роли команды", callback_data="adm_roles"), IBtn(text="🔄 Формулы", callback_data="adm_fix")],
     ]
   else:
-    # Управляющие видят ТОЛЬКО смены, без доступа к финансам и выплатам
     header = (
         f"⚙️ <b>Панель Управляющего (Контроль смен)</b>\n━━━━━━━━━━━━━━\n"
         f"📅 Текущий период: <b>{cur_period}</b>\n"
@@ -1551,12 +1563,21 @@ async def catch_requisites_input(m: types.Message):
 
 
 async def main():
+  # 1. Сначала мгновенно открываем порт для Render, чтобы деплой сразу стал зеленым (Live)
   app = web.Application()
   app.router.add_get("/", lambda r: web.Response(text="Bot is running!"))
   runner = web.AppRunner(app)
   await runner.setup()
-  await web.TCPSite(runner, "0.0.0.0", int(os.getenv("PORT", 8080))).start()
+  port = int(os.getenv("PORT") or 8080)
+  await web.TCPSite(runner, "0.0.0.0", port).start()
 
+  # 2. Сбрасываем возможные конфликты вебхуков перед запуском поллинга
+  try:
+    await bot.delete_webhook(drop_pending_updates=True)
+  except Exception as e:
+    print(f"Webhook drop warning: {e}")
+
+  # 3. Пакетно синхронизируем роли и формулы
   await asyncio.to_thread(sync_roles_and_formulas)
   asyncio.create_task(shift_timer_loop())
   await dp.start_polling(bot)
