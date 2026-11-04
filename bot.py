@@ -35,14 +35,16 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY")
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA").strip()
-RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "13ze6D8nDnjGtZ7QDOQAr5iZnyrVnLcEH").strip()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "").strip()
 
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "disa2026").strip()
 MANAGER_PASSWORD = os.getenv("MANAGER_PASSWORD", "disa_manager").strip()
+
+# Доступ к финансам имеют ТОЛЬКО ID из ADMIN_IDS (например: 1642599250,5619982112)
 INITIAL_ADMINS = [
     int(x.strip())
-    for x in os.getenv("ADMIN_IDS", "").split(",")
+    for x in os.getenv("ADMIN_IDS", "1642599250,5619982112").split(",")
     if x.strip().isdigit()
 ]
 
@@ -87,6 +89,7 @@ NAV_BTNS = {
 class Form(StatesGroup):
   shift_comment = State()
   retro_time = State()
+  retro_comment = State()
   meal_comment = State()
   fast_expense = State()
   custom_payout = State()
@@ -97,23 +100,34 @@ def now_astana() -> datetime:
   return datetime.now(TZ_ASTANA)
 
 
-def get_pay_period(dt: datetime) -> str:
+def get_pay_period(dt: datetime | date) -> str:
   m_name = MONTHS_RU[dt.month]
   half = "01-15" if dt.day <= 15 else f"16-{calendar.monthrange(dt.year, dt.month)[1]}"
   return f"{m_name} {dt.year} ({half})"
 
 
+def get_pay_period_from_str(date_str: str) -> str:
+  try:
+    dt = datetime.strptime(date_str.strip(), "%d.%m.%Y").date()
+    return get_pay_period(dt)
+  except ValueError:
+    return get_pay_period(now_astana())
+
+
 def is_admin(uid: int) -> bool:
+  """Финансовый доступ: только те, кто прописан в ADMIN_IDS"""
   return uid in admins
 
 
 def is_staff_lead(uid: int) -> bool:
+  """Доступ к просмотру и одобрению смен: админы + назначенные управляющие"""
   return uid in admins or uid in managers
 
 
 def parse_kzt(val: str) -> float:
   try:
-    return float(re.sub(r'[^\d.-]', '', str(val).replace(",", ".")))
+    cleaned = re.sub(r"[^\d.-]", "", str(val).replace(",", "."))
+    return float(cleaned) if cleaned and cleaned not in ("-", ".", "-.") else 0.0
   except ValueError:
     return 0.0
 
@@ -124,7 +138,7 @@ def parse_kzt(val: str) -> float:
 
 
 async def ask_gemini(contents) -> dict | None:
-  models = ["gemini-3.6-flash", "gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.0-flash"]
+  models = ["gemini-2.5-flash", "gemini-2.0-flash"]
   cfg = genai_types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
   for idx, m in enumerate(models):
     try:
@@ -133,7 +147,7 @@ async def ask_gemini(contents) -> dict | None:
         raw = resp.text.strip()
         return json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
     except Exception:
-      await asyncio.sleep(1.0 if idx == 0 else 0.3)
+      await asyncio.sleep(0.8 if idx == 0 else 0.3)
   return None
 
 
@@ -148,8 +162,9 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
     metadata = {
         "name": filename,
         "mimeType": "image/jpeg",
-        "parents": [RECEIPTS_FOLDER_ID],
     }
+    if RECEIPTS_FOLDER_ID:
+      metadata["parents"] = [RECEIPTS_FOLDER_ID]
     meta_bytes = json.dumps(metadata).encode()
 
     body = (
@@ -177,7 +192,7 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =====================================================================
-# 3. ТАБЛИЦА
+# 3. СИНХРОНИЗАЦИЯ И ОПЕРАЦИИ С ТАБЛИЦЕЙ
 # =====================================================================
 
 
@@ -196,7 +211,8 @@ def sync_roles_and_formulas():
         continue
       name = row[0].strip()
       role = row[1].strip().lower() if len(row) > 1 else ""
-      if any(w in role for w in ["управл", "менедж", "admin"]):
+      # Из таблицы подтягиваются ТОЛЬКО управляющие (для смен). Админы задаются строго по ID.
+      if any(w in role for w in ["управл", "менедж", "manager"]):
         mgr_names.add(name.lower())
 
       ws_pay.update_cell(idx, 4, f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "К возмещению")')
@@ -207,11 +223,12 @@ def sync_roles_and_formulas():
       ws_pay.update_cell(idx, 9, f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "Выплачено")')
       ws_pay.update_cell(idx, 10, cur_period)
 
+    managers.clear()
     for r in ref_rows:
-      if str(r.get("Имя", "")).strip().lower() in mgr_names:
-        cid = str(r.get("Chat ID", "")).strip()
-        if cid.isdigit():
-          managers.add(int(cid))
+      r_name = str(r.get("Имя", "")).strip().lower()
+      cid = str(r.get("Chat ID", "")).strip()
+      if cid.isdigit() and r_name in mgr_names:
+        managers.add(int(cid))
   except Exception as e:
     print(f"Sync error: {e}")
 
@@ -252,7 +269,7 @@ def get_employee_sync(user: types.User) -> str:
       ws_ref.append_row([name, f"@{user.username}" if user.username else "-", uid])
 
     ws_pay = spreadsheet.worksheet("Выплаты команде")
-    names = ws_pay.col_values(1)
+    names = [x.strip() for x in ws_pay.col_values(1)]
     if name not in names:
       r_idx = len(names) + 1
       cur_period = get_pay_period(now_astana())
@@ -286,16 +303,21 @@ def add_operation_sync(
 ):
   ws = spreadsheet.worksheet("Операции")
   tx = tx_id or f"TX-{random.randint(10000, 99999)}"
-  period = get_pay_period(now_astana())
-  next_row = len(ws.col_values(1)) + 1
+  period = get_pay_period_from_str(calc_date)
+  next_row = len(ws.get_all_values()) + 1
 
   taxi_val = amount if category == "Такси" else 0
   meals_val = amount if category == "Обеденные" else 0
   other_val = amount if category == "Прочие расходы" else 0
 
-  check_cell = f'=HYPERLINK("{drive_link}"; "📎 Чек")' if drive_link else (comment if comment else "Без чека")
-  if drive_link and comment:
-    check_cell = f'=HYPERLINK("{drive_link}"; "📎 Чек") & " | {comment}"'
+  safe_comment = (comment or "").replace('"', "«").strip()
+
+  if drive_link and safe_comment:
+    check_cell = f'=HYPERLINK("{drive_link}"; "📎 Чек | {safe_comment}")'
+  elif drive_link:
+    check_cell = f'=HYPERLINK("{drive_link}"; "📎 Открыть чек")'
+  else:
+    check_cell = safe_comment if safe_comment else "Без чека"
 
   ws.append_row(
       [
@@ -326,8 +348,8 @@ def get_debts_sync(filter_emp: str = None):
 
     debts[who] = debts.get(who, 0.0) + total_row
 
-    if filter_emp and (filter_emp.lower() in who.lower() or who.lower() in filter_emp.lower()):
-      cat = "Такси" if taxi_amt > 0 else ("Обеденные" if meal_amt > 0 else "Прочие расходы")
+    if filter_emp and who.lower() == filter_emp.strip().lower():
+      cat = "Такси" if taxi_amt != 0 else ("Обеденные" if meal_amt != 0 else "Прочие расходы")
       items.append({"date": r[1], "cat": cat, "amount": total_row, "comment": r[9] if len(r) > 9 else "-"})
   return debts, items
 
@@ -475,7 +497,7 @@ async def cmd_manager(m: types.Message):
   parts = m.text.split(maxsplit=1)
   if len(parts) > 1 and parts[1].strip() == MANAGER_PASSWORD:
     managers.add(m.from_user.id)
-    await m.answer("🔓 <b>Права Управляющего активированы!</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
+    await m.answer("🔓 <b>Права Управляющего (контроль смен) активированы!</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
 
 
 @dp.message(F.text == "💰 Мой баланс")
@@ -486,22 +508,25 @@ async def msg_balance(m: types.Message):
   total = sum(x["amount"] for x in items)
   cur_period = get_pay_period(now_astana())
 
-  taxi_sum = sum(x["amount"] for x in items if x["cat"] == "Такси")
-  meals_sum = sum(x["amount"] for x in items if x["cat"] == "Обеденные")
-  other_sum = sum(x["amount"] for x in items if x["cat"] == "Прочие расходы")
+  taxi_sum = sum(x["amount"] for x in items if x["cat"] == "Такси" and x["amount"] > 0)
+  meals_sum = sum(x["amount"] for x in items if x["cat"] == "Обеденные" and x["amount"] > 0)
+  other_sum = sum(x["amount"] for x in items if x["cat"] == "Прочие расходы" and x["amount"] > 0)
+  advance_sum = sum(abs(x["amount"]) for x in items if x["amount"] < 0)
 
   if total > 0.01:
     status = f"💵 <b>К выплате вам: {total:,.0f} ₸</b>"
   elif total < -0.01:
-    status = f"🟢 <b>Подотчетный баланс (на расходы): +{abs(total):,.0f} ₸</b>"
+    status = f"🟢 <b>Остаток подотчетного баланса: +{abs(total):,.0f} ₸</b>"
   else:
     status = "✨ <b>Все расчеты закрыты (0 ₸)</b>"
+
+  adv_line = f"\n💳 <i>Выдано в подотчет: {advance_sum:,.0f} ₸</i>" if advance_sum > 0 else ""
 
   await wait.edit_text(
       f"👤 <b>Сотрудник: {name}</b>\n"
       f"📅 Период: <b>{cur_period}</b>\n━━━━━━━━━━━━━━\n"
-      f"{status}\n\n"
-      f"📊 <b>Ваши расходы в таблице (к возмещению):</b>\n"
+      f"{status}{adv_line}\n\n"
+      f"📊 <b>Ваши расходы в текущем расчете:</b>\n"
       f"• 🚕 Такси: <b>{taxi_sum:,.0f} ₸</b>\n"
       f"• 🍔 Обеды: <b>{meals_sum:,.0f} ₸</b>\n"
       f"• 🧾 Прочее: <b>{other_sum:,.0f} ₸</b>",
@@ -534,7 +559,7 @@ async def cb_edit_reqs(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 6. СМЕНЫ С КОММЕНТАРИЕМ И ПРЯМАЯ КНОПКА ЗАВЕРШЕНИЯ
+# 6. СМЕНЫ: СТАРТ СЕЙЧАС, ЗАДНИМ ЧИСЛОМ И ЗАВЕРШЕНИЕ
 # =====================================================================
 
 
@@ -549,7 +574,7 @@ async def finish_shift(uid: int, end_dt: datetime, auto: bool = False) -> str | 
   title = "⏰ <b>Смена закрыта автоматически (нет ответа)</b>" if auto else "🔴 <b>Смена завершена!</b>"
   return (
       f"{title}\n━━━━━━━━━━━━━━\n"
-      f"📅 Дата: <b>{shift['date']}</b>\n"
+      f"📅 Дата старта: <b>{shift['date']}</b>\n"
       f"📝 Примечание: <i>{shift['comment']}</i>\n"
       f"🕒 Время: {shift['start'].strftime('%H:%M')} ➔ {end_dt.strftime('%H:%M')}\n"
       f"⏱ Отработано: <b>{h_int} ч. {m_int} мин.</b>"
@@ -608,7 +633,7 @@ async def cb_shift_end_inline(c: types.CallbackQuery):
   uid = c.from_user.id
   txt = await finish_shift(uid, end_dt=now_astana(), auto=False)
   await c.message.edit_text(txt or "Смена уже завершена.", parse_mode="HTML")
-  await bot.send_message(uid, "✅ <b>Меню обновлено.</b>", reply_markup=main_kb(uid), parse_mode="HTML")
+  await bot.send_message(uid, "✅ <b>Смена закрыта. Главное меню обновлено.</b>", reply_markup=main_kb(uid), parse_mode="HTML")
 
 
 @dp.message(F.text == "⏱ Моя смена")
@@ -616,8 +641,8 @@ async def msg_shift(m: types.Message):
   uid = m.from_user.id
   if uid not in active_shifts:
     kb = IMarkup(inline_keyboard=[
-        [IBtn(text="🟢 Начать смену сейчас", callback_data="smode|now")],
-        [IBtn(text="🕒 Начать задним числом (через Админа)", callback_data="smode|retro")],
+        [IBtn(text="🟢 Начать смену прямо сейчас", callback_data="smode|now")],
+        [IBtn(text="🕒 Начать задним числом (через Управляющего)", callback_data="smode|retro")],
     ])
     await m.answer("⏱ <b>Учет рабочего времени</b>\nУ вас нет активной смены. Выберите действие:", reply_markup=kb, parse_mode="HTML")
   else:
@@ -639,11 +664,23 @@ async def msg_shift(m: types.Message):
 
 
 @dp.callback_query(F.data.startswith("smode|"))
-async def cb_smode(c: types.CallbackQuery):
+async def cb_smode(c: types.CallbackQuery, state: FSMContext):
   await c.answer()
   mode = c.data.split("|")[1]
-  act = "s_now" if mode == "now" else "s_retro"
-  await c.message.edit_text("📅 <b>Выберите дату смены:</b>", reply_markup=date_picker_kb(act), parse_mode="HTML")
+  
+  if mode == "now":
+    today_str = now_astana().strftime("%d.%m.%Y")
+    await state.update_data(date=today_str)
+    await state.set_state(Form.shift_comment)
+    kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
+    await c.message.edit_text(
+        f"🟢 <b>Старт смены: Сегодня ({today_str})</b>\n\n"
+        f"📝 <b>Напишите короткий комментарий (площадка / задача):</b>\n"
+        f"<blockquote>Например: <code>Склад погрузка</code> или <code>Концертный зал</code></blockquote>",
+        reply_markup=kb, parse_mode="HTML",
+    )
+  else:
+    await c.message.edit_text("📅 <b>Выберите дату, когда началась смена:</b>", reply_markup=date_picker_kb("s_retro"), parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "shift_extend")
@@ -682,44 +719,117 @@ async def process_shift_comment(m: types.Message, state: FSMContext):
 @dp.message(Form.retro_time, F.text)
 async def process_retro_time(m: types.Message, state: FSMContext):
   data = await state.get_data()
-  await state.clear()
+  date_str = data.get("date", now_astana().strftime("%d.%m.%Y"))
+  text = m.text.strip().lower()
+
+  try:
+    base_date = datetime.strptime(date_str, "%d.%m.%Y").date()
+  except ValueError:
+    base_date = now_astana().date()
+
   now = now_astana()
-  target = now
+  target = None
 
-  match = re.search(r"\b(\d{1,2})[:.](\d{2})\b", m.text)
+  match = re.search(r"\b(\d{1,2})[:.](\d{2})\b", text)
   if match:
-    target = now.replace(hour=int(match.group(1)), minute=int(match.group(2)), second=0)
-    if target > now:
-      target -= timedelta(days=1)
-  elif "час" in m.text:
-    nums = re.findall(r"\d+", m.text)
-    target = now - timedelta(hours=int(nums[0]) if nums else 2)
+    h, mn = int(match.group(1)), int(match.group(2))
+    if 0 <= h <= 23 and 0 <= mn <= 59:
+      target = datetime(base_date.year, base_date.month, base_date.day, h, mn, 0, tzinfo=TZ_ASTANA)
 
+  if not target:
+    match_4d = re.search(r"\b(\d{2})(\d{2})\b", text)
+    if match_4d:
+      h, mn = int(match_4d.group(1)), int(match_4d.group(2))
+      if 0 <= h <= 23 and 0 <= mn <= 59:
+        target = datetime(base_date.year, base_date.month, base_date.day, h, mn, 0, tzinfo=TZ_ASTANA)
+
+  if not target:
+    match_hour_only = re.search(r"\b(\d{1,2})\b", text)
+    if match_hour_only and "назад" not in text:
+      h = int(match_hour_only.group(1))
+      if 0 <= h <= 23:
+        target = datetime(base_date.year, base_date.month, base_date.day, h, 0, 0, tzinfo=TZ_ASTANA)
+
+  if not target and "назад" in text:
+    nums = re.findall(r"\d+", text)
+    if nums:
+      target = now - timedelta(hours=int(nums[0]))
+      date_str = target.strftime("%d.%m.%Y")
+
+  if not target:
+    return await m.answer(
+        "⚠️ <b>Не удалось распознать время.</b>\n"
+        "Укажите время начала смены в формате <code>14:00</code> или <code>11.30</code>:",
+        parse_mode="HTML",
+    )
+
+  if target > now:
+    return await m.answer(
+        f"⚠️ Время начала (<b>{target.strftime('%d.%m.%Y %H:%M')}</b>) не может быть в будущем!\n"
+        "Введите фактическое время начала:",
+        parse_mode="HTML",
+    )
+
+  await state.update_data(date=date_str, retro_iso=target.isoformat())
+  await state.set_state(Form.retro_comment)
+  kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
+  await m.answer(
+      f"🕒 Время старта: <b>{target.strftime('%d.%m.%Y в %H:%M')}</b>\n\n"
+      f"📝 <b>Напишите короткий комментарий к смене (площадка / задача):</b>",
+      reply_markup=kb,
+      parse_mode="HTML",
+  )
+
+
+@dp.message(Form.retro_comment, F.text)
+async def process_retro_comment(m: types.Message, state: FSMContext):
+  data = await state.get_data()
+  await state.clear()
+
+  target = datetime.fromisoformat(data["retro_iso"])
+  date_str = data["date"]
+  comment = m.text.strip()
   rid = f"SR-{random.randint(1000, 9999)}"
   emp = await get_emp(m.from_user)
-  pending_shifts[rid] = {"uid": m.from_user.id, "date": data["date"], "start": target, "emp": emp, "comment": "Задним числом"}
+
+  pending_shifts[rid] = {
+      "uid": m.from_user.id,
+      "date": date_str,
+      "start": target,
+      "emp": emp,
+      "comment": comment,
+  }
 
   kb = IMarkup(inline_keyboard=[[
       IBtn(text="✅ Одобрить", callback_data=f"s_appr|{rid}"),
       IBtn(text="❌ Отклонить", callback_data=f"s_rej|{rid}"),
   ]])
-  for aid in admins:
+  # Одобрять смены могут и админы, и управляющие
+  for lid in admins | managers:
     try:
       await bot.send_message(
-          aid,
+          lid,
           f"⚠️ <b>Запрос смены задним числом</b>\n━━━━━━━━━━━━━━\n"
-          f"👤 Сотрудник: <b>{emp}</b>\n📅 Дата: {data['date']}\n🕒 Старт: <b>{target.strftime('%H:%M')}</b>",
+          f"👤 Сотрудник: <b>{emp}</b>\n"
+          f"📅 Дата: <b>{date_str}</b>\n"
+          f"🕒 Фактический старт: <b>{target.strftime('%H:%M')}</b>\n"
+          f"📝 Комментарий: <i>{comment}</i>",
           reply_markup=kb, parse_mode="HTML",
       )
     except Exception:
       pass
-  await m.answer(f"⏳ Запрос на старт с <b>{target.strftime('%H:%M')}</b> отправлен Администратору.", parse_mode="HTML")
+
+  await m.answer(
+      f"⏳ Запрос на начало смены с <b>{target.strftime('%d.%m.%Y в %H:%M')}</b> ({comment}) отправлен на согласование.",
+      reply_markup=main_kb(m.from_user.id),
+      parse_mode="HTML",
+  )
 
 
 @dp.callback_query(F.data.startswith(("s_appr|", "s_rej|")))
 async def cb_retro_decision(c: types.CallbackQuery):
-  if not is_admin(c.from_user.id):
-    return await c.answer("Только для Главного Администратора!", show_alert=True)
+  if not is_staff_lead(c.from_user.id):
+    return await c.answer("Только для Администратора и Управляющих!", show_alert=True)
   await c.answer()
   act, rid = c.data.split("|")
   req = pending_shifts.pop(rid, None)
@@ -739,9 +849,19 @@ async def cb_retro_decision(c: types.CallbackQuery):
         "comment": req["comment"], "next_check": next_check,
         "waiting": False, "prompt_at": None,
     }
-    await c.message.edit_text(f"✅ Смена <b>{req['emp']}</b> одобрена с {start_time.strftime('%H:%M')}!", parse_mode="HTML")
+    await c.message.edit_text(
+        f"✅ Смена <b>{req['emp']}</b> одобрена с {start_time.strftime('%H:%M')} ({req['comment']})!",
+        parse_mode="HTML",
+    )
     try:
-      await bot.send_message(req["uid"], f"✅ <b>Администратор одобрил смену!</b>\n📅 {req['date']} ({start_time.strftime('%H:%M')})", reply_markup=main_kb(req["uid"]), parse_mode="HTML")
+      await bot.send_message(
+          req["uid"],
+          f"✅ <b>Ваша смена задним числом одобрена!</b>\n"
+          f"📅 Старт зафиксирован: <b>{req['date']} в {start_time.strftime('%H:%M')}</b>\n"
+          f"📝 Примечание: <i>{req['comment']}</i>",
+          reply_markup=main_kb(req["uid"]),
+          parse_mode="HTML",
+      )
     except Exception:
       pass
   else:
@@ -753,7 +873,7 @@ async def cb_retro_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД
+# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД (ПОДТВЕРЖДАЮТ ТОЛЬКО АДМИНЫ ПО ID)
 # =====================================================================
 
 
@@ -779,10 +899,10 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
       IBtn(text="✅ Одобрить 2 500 ₸", callback_data=f"ml_ok|{mid}"),
       IBtn(text="❌ Отклонить", callback_data=f"ml_no|{mid}"),
   ]])
-  for lid in admins | managers:
+  for aid in admins:
     try:
       await bot.send_message(
-          lid,
+          aid,
           f"🍔 <b>Запрос на обеденные (2 500 ₸)</b>\n━━━━━━━━━━━━━━\n"
           f"👤 Сотрудник: <b>{emp}</b>\n📅 Дата: <b>{data['date']}</b>\n"
           f"📝 Примечание: <i>{m.text.strip()}</i>\n\nОдобрить начисление?",
@@ -790,13 +910,13 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
       )
     except Exception:
       pass
-  await m.answer(f"⏳ <b>Запрос отправлен управляющему!</b>\n📅 Дата: {data['date']}", parse_mode="HTML")
+  await m.answer(f"⏳ <b>Запрос отправлен Администратору!</b>\n📅 Дата: {data['date']}", parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith(("ml_ok|", "ml_no|")))
 async def cb_meal_decision(c: types.CallbackQuery):
-  if not is_staff_lead(c.from_user.id):
-    return await c.answer("Только для управляющих!", show_alert=True)
+  if not is_admin(c.from_user.id):
+    return await c.answer("Финансовые запросы одобряет только Администратор!", show_alert=True)
   await c.answer()
   act, mid = c.data.split("|")
   req = pending_meal_requests.pop(mid, None)
@@ -804,7 +924,7 @@ async def cb_meal_decision(c: types.CallbackQuery):
     return await c.message.edit_text("Запрос на обед уже обработан.")
 
   if act == "ml_ok":
-    approver = c.from_user.full_name or "Управляющий"
+    approver = c.from_user.full_name or "Администратор"
     await asyncio.to_thread(
         add_operation_sync,
         req["date"], "Обеденные", 2500, req["emp"],
@@ -832,7 +952,7 @@ async def cb_meal_decision(c: types.CallbackQuery):
 async def msg_taxi_prompt(m: types.Message):
   now = now_astana()
   night = now.hour >= 22 or now.hour < 7
-  mode_txt = "🌙 Ночной тариф (22:00–07:00) — начисление сразу!" if night else "☀️ Дневной тариф — через согласование."
+  mode_txt = "🌙 Ночной тариф (22:00–07:00) — начисление сразу!" if night else "☀️ Дневной тариф — через согласование с Администратором."
   await m.answer(
       f"🚕 <b>Учет поездок на такси</b>\n━━━━━━━━━━━━━━\nОтправьте скриншот поездки из Яндекс Go.\n<blockquote>{mode_txt}</blockquote>",
       parse_mode="HTML",
@@ -847,14 +967,13 @@ async def msg_other_expenses_prompt(m: types.Message):
   )
 
 
-# Обработчик фото-чеков для ОБЫЧНЫХ расходов (с фильтром StateFilter(None))
 @dp.message(StateFilter(None), F.photo)
 async def handle_receipt_photo(m: types.Message):
   photo = m.photo[-1]
   if photo.file_unique_id in saved_files:
     return await m.answer("⚠️ Этот чек уже был загружен ранее!")
 
-  wait = await m.answer("🔍 <b>Сканирую чек и сохраняю в папку «Чеки»...</b>", parse_mode="HTML")
+  wait = await m.answer("🔍 <b>Сканирую чек и сохраняю в папку на Диске...</b>", parse_mode="HTML")
   buf = io.BytesIO()
   await bot.download(photo, destination=buf)
   img_bytes = buf.getvalue()
@@ -914,21 +1033,13 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
         reply_markup=kb, parse_mode="HTML",
     )
 
-  elif act == "s_now":
-    await state.update_data(date=label)
-    await state.set_state(Form.shift_comment)
-    kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
-    await c.message.edit_text(
-        f"📅 Дата: <b>{label}</b>\n\n📝 <b>Укажите короткий комментарий к смене:</b>",
-        reply_markup=kb, parse_mode="HTML",
-    )
-
   elif act == "s_retro":
     await state.update_data(date=label)
     await state.set_state(Form.retro_time)
     kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
     await c.message.edit_text(
-        f"📅 Дата: <b>{label}</b>\n\n🕒 <b>Во сколько фактически началась смена?</b>",
+        f"📅 Дата: <b>{label}</b>\n\n🕒 <b>Во сколько фактически началась смена?</b>\n"
+        f"<blockquote>Пример: <code>14:00</code> или <code>11.30</code></blockquote>",
         reply_markup=kb, parse_mode="HTML",
     )
 
@@ -952,10 +1063,10 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
           IBtn(text="✅ Одобрить", callback_data=f"tx_ok|{tx_id}"),
           IBtn(text="❌ Отклонить", callback_data=f"tx_no|{tx_id}"),
       ]])
-      for lid in admins | managers:
+      for aid in admins:
         try:
           await bot.send_message(
-              lid,
+              aid,
               f"🚕 <b>Дневное такси на согласовании</b>\n━━━━━━━━━━━━━━\n"
               f"👤 Сотрудник: <b>{rec['emp']}</b>\n💵 Сумма: <b>{rec['amount']:,.0f} ₸</b>\n📅 Дата: {label}",
               reply_markup=kb, parse_mode="HTML",
@@ -963,7 +1074,7 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
         except Exception:
           pass
       return await c.message.edit_text(
-          f"⏳ <b>Дневное такси отправлено на согласование!</b>\n📅 {label} — <b>{rec['amount']:,.0f} ₸</b>", parse_mode="HTML",
+          f"⏳ <b>Дневное такси отправлено Администратору на согласование!</b>\n📅 {label} — <b>{rec['amount']:,.0f} ₸</b>", parse_mode="HTML",
       )
 
     await asyncio.to_thread(
@@ -976,11 +1087,13 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
         f"✅ <b>Расход внесен в таблицу!</b>\n━━━━━━━━━━━━━━\n"
         f"📂 Категория: <b>{rec['category']}</b>\n📅 Дата: <b>{label}</b>\n"
         f"💵 Сумма: <b>{rec['amount']:,.0f} ₸</b>\n👤 {rec['emp']}\n"
-        f"📁 <i>Файл сохранен в папку «Чеки» на Google Диске.</i>",
+        f"📁 <i>Файл сохранен в папку чеков на Диске.</i>",
         parse_mode="HTML",
     )
 
   elif act == "fastexp":
+    if not is_admin(uid):
+      return await c.message.edit_text("⛔️ Доступ только для Администратора.")
     await state.update_data(date=label)
     await state.set_state(Form.fast_expense)
     kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
@@ -995,8 +1108,8 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith(("tx_ok|", "tx_no|")))
 async def cb_taxi_decision(c: types.CallbackQuery):
-  if not is_staff_lead(c.from_user.id):
-    return await c.answer("Только для управляющих!", show_alert=True)
+  if not is_admin(c.from_user.id):
+    return await c.answer("Финансовые операции подтверждает только Администратор!", show_alert=True)
   await c.answer()
   act, tx_id = c.data.split("|")
   new_st = "К возмещению" if act == "tx_ok" else "Отклонено"
@@ -1015,15 +1128,11 @@ async def cb_taxi_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 9. ПАНЕЛЬ УПРАВЛЕНИЯ, ВСЕ АККАУНТЫ, ВЫПЛАТЫ И ПОДОТЧЕТ
+# 9. ПАНЕЛЬ УПРАВЛЕНИЯ (ФИНАНСЫ СТРОГО У АДМИНОВ ПО ID)
 # =====================================================================
 
 
 async def render_control_panel(target, uid: int):
-  btns = [
-      [IBtn(text="⚡️ Внести расход (Фото / Текст)", callback_data="adm_fast")],
-      [IBtn(text=f"⏱ Смены онлайн ({len(active_shifts)})", callback_data="adm_shifts")],
-  ]
   cur_period = get_pay_period(now_astana())
 
   if is_admin(uid):
@@ -1036,16 +1145,22 @@ async def render_control_panel(target, uid: int):
         f"👥 Сотрудников в системе: <b>{len(team_members)}</b>\n"
         f"🟢 Активных смен сейчас: <b>{len(active_shifts)}</b>"
     )
-    btns.extend([
+    btns = [
+        [IBtn(text="⚡️ Внести расход (Фото / Текст)", callback_data="adm_fast")],
         [IBtn(text=f"💸 Взаиморасчеты с командой ({len(team_members)})", callback_data="adm_paylist")],
+        [IBtn(text=f"⏱ Смены онлайн ({len(active_shifts)})", callback_data="adm_shifts")],
         [IBtn(text="👥 Роли команды", callback_data="adm_roles"), IBtn(text="🔄 Формулы", callback_data="adm_fix")],
-    ])
+    ]
   else:
+    # Управляющие видят ТОЛЬКО смены, без доступа к финансам и выплатам
     header = (
-        f"⚙️ <b>Панель Управляющего</b>\n━━━━━━━━━━━━━━\n"
+        f"⚙️ <b>Панель Управляющего (Контроль смен)</b>\n━━━━━━━━━━━━━━\n"
         f"📅 Текущий период: <b>{cur_period}</b>\n"
         f"🟢 Активных смен сейчас: <b>{len(active_shifts)}</b>"
     )
+    btns = [
+        [IBtn(text=f"⏱ Смены онлайн ({len(active_shifts)})", callback_data="adm_shifts")],
+    ]
 
   kb = IMarkup(inline_keyboard=btns)
   if isinstance(target, types.Message):
@@ -1071,6 +1186,8 @@ async def cb_adm_back(c: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "adm_fix")
 async def cb_adm_fix(c: types.CallbackQuery):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Доступно только Администратору!", show_alert=True)
   await c.answer("Синхронизирую формулы...")
   await asyncio.to_thread(sync_roles_and_formulas)
   await c.message.answer("✅ Формулы и расчетные периоды обновлены!")
@@ -1078,16 +1195,19 @@ async def cb_adm_fix(c: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm_fast")
 async def cb_adm_fast(c: types.CallbackQuery):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Доступно только Администратору!", show_alert=True)
   await c.answer()
   await c.message.edit_text("⚡️ <b>Выберите дату расхода:</b>", reply_markup=date_picker_kb("fastexp"), parse_mode="HTML")
 
 
-# --- ОБРАБОТЧИК ФОТО ЧЕКА ОТ УПРАВЛЯЮЩЕГО ---
 @dp.message(Form.fast_expense, F.photo)
 async def process_fast_expense_photo(m: types.Message, state: FSMContext):
+  if not is_admin(m.from_user.id):
+    return await state.clear()
   d = await state.get_data()
   await state.clear()
-  wait = await m.answer("🔍 <b>Сканирую чек управляющего и сохраняю на Диск...</b>", parse_mode="HTML")
+  wait = await m.answer("🔍 <b>Сканирую чек и сохраняю на Диск...</b>", parse_mode="HTML")
 
   photo = m.photo[-1]
   buf = io.BytesIO()
@@ -1098,9 +1218,9 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
 
   caption = m.caption or ""
-  prompt_addon = f' Учти комментарий управляющего: "{caption}".' if caption else ""
+  prompt_addon = f' Учти комментарий: "{caption}".' if caption else ""
   prompt = (
-      'Изучи чек.' + prompt_addon + ' Верни ТОЛЬКО JSON: '
+      "Изучи чек." + prompt_addon + " Верни ТОЛЬКО JSON: "
       '{"amount": число, "category": "Такси" | "Прочие расходы", '
       '"desc": "суть/название", "personal": true если написано лично/свои иначе false}'
   )
@@ -1122,15 +1242,16 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
 
   await wait.edit_text(
       f"✅ <b>Расход внесен с чеком!</b>\n━━━━━━━━━━━━━━\n"
-      f"📅 {d['date']} | 💵 <b>{amt:,.0f} ₸</b>\n📂 {res.get('category')} ({payer})\n📁 <i>Файл сохранен в папку «Чеки» на Диске.</i>",
+      f"📅 {d['date']} | 💵 <b>{amt:,.0f} ₸</b>\n📂 {res.get('category')} ({payer})\n📁 <i>Файл сохранен в папку чеков на Диске.</i>",
       reply_markup=IMarkup(inline_keyboard=[[IBtn(text="⬅️ В панель", callback_data="adm_back")]]),
       parse_mode="HTML",
   )
 
 
-# --- ОБРАБОТЧИК ТЕКСТА ОТ УПРАВЛЯЮЩЕГО ---
 @dp.message(Form.fast_expense, F.text)
 async def process_fast_expense(m: types.Message, state: FSMContext):
+  if not is_admin(m.from_user.id):
+    return await state.clear()
   d = await state.get_data()
   await state.clear()
   wait = await m.answer("🤖 Разбираю расход...")
@@ -1161,6 +1282,8 @@ async def process_fast_expense(m: types.Message, state: FSMContext):
 
 @dp.callback_query(F.data == "adm_shifts")
 async def cb_adm_shifts(c: types.CallbackQuery):
+  if not is_staff_lead(c.from_user.id):
+    return await c.answer("Нет доступа!", show_alert=True)
   await c.answer()
   if not active_shifts:
     txt = "⏱ <b>Сейчас никто не находится на смене.</b>"
@@ -1178,6 +1301,8 @@ async def cb_adm_shifts(c: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm_roles")
 async def cb_adm_roles(c: types.CallbackQuery):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Только для Главного Администратора!", show_alert=True)
   await c.answer()
   rows = await asyncio.to_thread(lambda: spreadsheet.worksheet("Выплаты команде").get_all_values()[1:])
   kb = []
@@ -1187,11 +1312,13 @@ async def cb_adm_roles(c: types.CallbackQuery):
       icon = "⭐️" if "управл" in role.lower() else "👤"
       kb.append([IBtn(text=f"{icon} {name} ({role})", callback_data=f"trole|{name[:20]}")])
   kb.append([IBtn(text="⬅️ Назад", callback_data="adm_back")])
-  await c.message.edit_text("👥 <b>Нажмите на сотрудника для смены роли:</b>", reply_markup=IMarkup(inline_keyboard=kb), parse_mode="HTML")
+  await c.message.edit_text("👥 <b>Назначение Управляющих (контроль смен):</b>", reply_markup=IMarkup(inline_keyboard=kb), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("trole|"))
 async def cb_toggle_role(c: types.CallbackQuery):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Только для Главного Администратора!", show_alert=True)
   await c.answer()
   prefix = c.data.split("|")[1]
   def toggle():
@@ -1206,9 +1333,10 @@ async def cb_toggle_role(c: types.CallbackQuery):
   await cb_adm_roles(c)
 
 
-# --- ПОКАЗ ВСЕХ АККАУНТОВ КОМАНДЫ ---
 @dp.callback_query(F.data == "adm_paylist")
 async def cb_adm_paylist(c: types.CallbackQuery):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Доступ к финансам только у Администратора!", show_alert=True)
   await c.answer()
   team = await asyncio.to_thread(get_all_team_members_sync)
   cur_period = get_pay_period(now_astana())
@@ -1243,6 +1371,8 @@ async def cb_adm_paylist(c: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("pay|"))
 async def cb_pay_prep(c: types.CallbackQuery, state: FSMContext):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Доступ к финансам только у Администратора!", show_alert=True)
   await c.answer()
   prefix = c.data.split("|")[1]
   team = await asyncio.to_thread(get_all_team_members_sync)
@@ -1281,9 +1411,10 @@ async def cb_pay_prep(c: types.CallbackQuery, state: FSMContext):
   )
 
 
-# --- ВЫДАЧА РАБОЧИХ (ПОДОТЧЕТНЫХ) СРЕДСТВ ---
 @dp.callback_query(F.data == "give_advance")
 async def cb_give_advance_start(c: types.CallbackQuery, state: FSMContext):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Доступно только Администратору!", show_alert=True)
   await c.answer()
   d = await state.get_data()
   await state.set_state(Form.advance_amount)
@@ -1298,6 +1429,8 @@ async def cb_give_advance_start(c: types.CallbackQuery, state: FSMContext):
 
 @dp.message(Form.advance_amount, F.text)
 async def process_advance_amount(m: types.Message, state: FSMContext):
+  if not is_admin(m.from_user.id):
+    return await state.clear()
   try:
     advance_val = float(m.text.replace(" ", "").replace(",", ".").strip())
   except ValueError:
@@ -1328,11 +1461,10 @@ async def process_advance_amount(m: types.Message, state: FSMContext):
   )
 
 
-# --- ПОЛНАЯ И ЧАСТИЧНАЯ ВЫПЛАТА ДОЛГА ---
 def settle_payout_sync(emp: str, paid: float, debt: float):
   ws = spreadsheet.worksheet("Операции")
   for idx, r in enumerate(ws.get_all_values()[1:], start=2):
-    if len(r) >= 9 and emp.lower() in r[3].lower() and "к возмещению" in r[8].lower():
+    if len(r) >= 9 and r[3].strip().lower() == emp.strip().lower() and "к возмещению" in r[8].lower():
       ws.update_cell(idx, 9, "Выплачено")
 
   diff = paid - debt
@@ -1347,6 +1479,8 @@ def settle_payout_sync(emp: str, paid: float, debt: float):
 
 @dp.callback_query(F.data == "pay_exact")
 async def cb_pay_exact(c: types.CallbackQuery, state: FSMContext):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Доступно только Администратору!", show_alert=True)
   await c.answer("Списываю долг...")
   d = await state.get_data()
   await state.clear()
@@ -1357,12 +1491,14 @@ async def cb_pay_exact(c: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "pay_custom")
 async def cb_pay_custom(c: types.CallbackQuery, state: FSMContext):
+  if not is_admin(c.from_user.id):
+    return await c.answer("Доступно только Администратору!", show_alert=True)
   await c.answer()
   d = await state.get_data()
   await state.set_state(Form.custom_payout)
   kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
   await c.message.edit_text(
-      f"👤 <b>{d['emp']}</b> (теку долг: {d['debt']:,.0f} ₸)\n\n"
+      f"👤 <b>{d['emp']}</b> (текущий долг: {d['debt']:,.0f} ₸)\n\n"
       f"💸 <b>Введите фактически переведенную сумму:</b>\n"
       f"<blockquote>Если сумма превысит долг, остаток автоматически станет подотчетным балансом.</blockquote>",
       reply_markup=kb, parse_mode="HTML",
@@ -1371,6 +1507,8 @@ async def cb_pay_custom(c: types.CallbackQuery, state: FSMContext):
 
 @dp.message(Form.custom_payout, F.text)
 async def process_custom_pay(m: types.Message, state: FSMContext):
+  if not is_admin(m.from_user.id):
+    return await state.clear()
   try:
     paid = float(m.text.replace(" ", "").replace(",", ".").strip())
   except ValueError:
