@@ -140,16 +140,27 @@ def parse_kzt(val: str) -> float:
 
 
 async def ask_gemini(contents) -> dict | None:
-  models = ["gemini-2.5-flash", "gemini-2.0-flash"]
-  cfg = genai_types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
+  models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+  cfg = genai_types.GenerateContentConfig(
+      response_mime_type="application/json",
+      temperature=0.1,
+  )
   for idx, m in enumerate(models):
     try:
-      resp = ai_client.models.generate_content(model=m, contents=contents, config=cfg)
+      resp = await ai_client.aio.models.generate_content(
+          model=m,
+          contents=contents,
+          config=cfg,
+      )
       if resp and resp.text:
         raw = resp.text.strip()
-        return json.loads(raw[raw.find("{") : raw.rfind("}") + 1])
-    except Exception:
-      await asyncio.sleep(0.8 if idx == 0 else 0.3)
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start != -1 and end != -1:
+          return json.loads(raw[start : end + 1])
+    except Exception as e:
+      print(f"Gemini OCR error on model {m}: {e}")
+      await asyncio.sleep(0.5)
   return None
 
 
@@ -257,28 +268,23 @@ def get_employee_sync(user: types.User) -> str:
     ws_ref = spreadsheet.worksheet("Справочники")
     records = ws_ref.get_all_records()
 
-    # 1. Поиск по Chat ID
     for r in records:
       if str(r.get("Chat ID", "")).strip() == uid:
         matched_name = str(r.get("Имя", "")).strip()
         break
 
-    # 2. Поиск по Telegram username
     if not matched_name and uname:
       for r in records:
         if str(r.get("Telegram никнейм", "")).strip().lower() == uname:
           matched_name = str(r.get("Имя", "")).strip()
-          # Привязываем найденный Chat ID
           idx = records.index(r) + 2
           ws_ref.update_cell(idx, 3, uid)
           break
 
-    # 3. Если сотрудник абсолютно новый — заносим в Справочники
     if not matched_name:
       matched_name = tg_display
       ws_ref.append_row([matched_name, f"@{user.username}" if user.username else "-", uid])
 
-    # 4. Проверяем, есть ли это имя в «Выплатах команде», чтобы формулы SUMIFS всегда совпадали
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     existing_names = [x.strip().lower() for x in ws_pay.col_values(1)]
     if matched_name.lower() not in existing_names:
@@ -310,7 +316,6 @@ async def get_emp(user: types.User) -> str:
   return emp_cache.get(str(user.id)) or await asyncio.to_thread(get_employee_sync, user)
 
 
-# --- УЧЕТ СМЕН В ЛИСТЕ «СМЕНЫ» ---
 def log_shift_start_sync(shift_id: str, date_str: str, emp: str, start_dt: datetime, comment: str):
   try:
     ws = spreadsheet.worksheet("Смены")
@@ -366,7 +371,6 @@ def log_full_completed_shift_sync(shift_id: str, date_str: str, emp: str, start_
     print(f"Full retro shift log error: {e}")
 
 
-# --- КАССА ГЛАВНОГО УПРАВЛЯЮЩЕГО ---
 def get_admin_cash_summary_sync() -> dict:
   try:
     ws = spreadsheet.worksheet("Касса управляющего")
