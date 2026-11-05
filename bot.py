@@ -140,7 +140,7 @@ def parse_kzt(val: str) -> float:
 
 
 async def ask_gemini(contents) -> dict | None:
-  models = ["gemini-2.8-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+  models = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
   cfg = genai_types.GenerateContentConfig(
       response_mime_type="application/json",
       temperature=0.1,
