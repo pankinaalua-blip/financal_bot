@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 import gspread
+from PIL import Image
 
 # =====================================================================
 # 1. КОНФИГУРАЦИЯ
@@ -135,12 +136,12 @@ def parse_kzt(val: str) -> float:
 
 
 # =====================================================================
-# 2. ИИ И GOOGLE ДИСК
+# 2. ИИ (GEMINI + PILLOW) И GOOGLE ДИСК
 # =====================================================================
 
 
 async def ask_gemini(contents) -> dict | None:
-  models = ["gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+  models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
   cfg = genai_types.GenerateContentConfig(
       response_mime_type="application/json",
       temperature=0.1,
@@ -159,7 +160,7 @@ async def ask_gemini(contents) -> dict | None:
         if start != -1 and end != -1:
           return json.loads(raw[start : end + 1])
     except Exception as e:
-      print(f"Gemini OCR error on model {m}: {e}")
+      print(f"❌ Gemini Error on [{m}]: {e}")
       await asyncio.sleep(0.5)
   return None
 
@@ -1164,7 +1165,7 @@ async def cb_meal_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ И МАРШРУТИЗАЦИЯ
+# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ (F.photo БЕЗ БЛОКИРУЮЩИХ ФИЛЬТРОВ)
 # =====================================================================
 
 
@@ -1187,13 +1188,19 @@ async def msg_other_expenses_prompt(m: types.Message):
   )
 
 
-@dp.message(StateFilter(None), F.photo)
-async def handle_receipt_photo(m: types.Message):
+@dp.message(F.photo)
+async def handle_receipt_photo(m: types.Message, state: FSMContext):
+  cur_state = await state.get_state()
+  if cur_state == Form.fast_expense:
+    return await process_fast_expense_photo(m, state)
+
+  await state.clear()
+
   photo = m.photo[-1]
   if photo.file_unique_id in saved_files:
     return await m.answer("⚠️ Этот чек уже был загружен ранее!")
 
-  wait = await m.answer("🔍 <b>Сканирую чек и сохраняю в папку на Диске...</b>", parse_mode="HTML")
+  wait = await m.answer("🔍 <b>Сканирую чек и сохраняю на Диск...</b>", parse_mode="HTML")
   buf = io.BytesIO()
   await bot.download(photo, destination=buf)
   img_bytes = buf.getvalue()
@@ -1201,15 +1208,23 @@ async def handle_receipt_photo(m: types.Message):
   fname = f"check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
 
+  buf.seek(0)
+  pil_img = Image.open(buf)
+
   prompt = (
-      "Изучи чек и верни ТОЛЬКО JSON: "
-      '{"amount": число, "merchant": "продавец", '
-      '"category": "Такси" | "Прочие расходы", '
-      '"description": "2-4 слова"}'
+      "Распознай данные чека или скриншота такси. Верни ТОЛЬКО JSON: "
+      '{"amount": число_суммы_без_пробелов, "merchant": "продавец или Яндекс Go", '
+      '"category": "Такси" или "Прочие расходы", '
+      '"description": "кратко суть (2-4 слова)"}'
   )
-  data = await ask_gemini([genai_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), prompt])
-  if not data:
-    return await wait.edit_text("⚠️ Не удалось распознать изображение. Отправьте фото еще раз.")
+
+  data = await ask_gemini([pil_img, prompt])
+  if not data or not data.get("amount"):
+    return await wait.edit_text(
+        "⚠️ <b>Не удалось распознать сумму на чеке.</b>\n"
+        "Убедитесь, что фото четкое, и отправьте изображение еще раз.",
+        parse_mode="HTML",
+    )
 
   amt = float(data.get("amount", 0))
   merch = data.get("merchant", "Чек")
@@ -1434,6 +1449,7 @@ async def cb_adm_fix(c: types.CallbackQuery):
   await c.message.answer("✅ Формулы, часы смен и расчетные периоды обновлены!")
 
 
+# --- ПОПОЛНЕНИЕ СОБСТВЕННОГО БАЛАНСА УПРАВЛЯЮЩЕГО ---
 @dp.callback_query(F.data == "adm_topup")
 async def cb_adm_topup(c: types.CallbackQuery, state: FSMContext):
   if not is_admin(c.from_user.id):
@@ -1479,6 +1495,7 @@ async def process_admin_topup(m: types.Message, state: FSMContext):
   )
 
 
+# --- РАСХОД КАССЫ УПРАВЛЯЮЩЕГО ---
 @dp.callback_query(F.data == "adm_fast")
 async def cb_adm_fast(c: types.CallbackQuery):
   if not is_admin(c.from_user.id):
@@ -1503,6 +1520,9 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
   fname = f"admin_check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
 
+  buf.seek(0)
+  pil_img = Image.open(buf)
+
   caption = m.caption or ""
   prompt_addon = f' Учти комментарий: "{caption}".' if caption else ""
   prompt = (
@@ -1511,7 +1531,7 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
       '"desc": "продавец и суть (2-5 слов)"}'
   )
 
-  res = await ask_gemini([genai_types.Part.from_bytes(data=img_bytes, mime_type="image/jpeg"), prompt])
+  res = await ask_gemini([pil_img, prompt])
   if not res:
     res = {"amount": 0, "category": "Прочее", "desc": caption or "Чек управляющего"}
 
@@ -1574,6 +1594,7 @@ async def process_fast_expense(m: types.Message, state: FSMContext):
   )
 
 
+# --- СМЕНЫ И РОЛИ ---
 @dp.callback_query(F.data == "adm_shifts")
 async def cb_adm_shifts(c: types.CallbackQuery):
   if not is_staff_lead(c.from_user.id):
@@ -1627,6 +1648,7 @@ async def cb_toggle_role(c: types.CallbackQuery):
   await cb_adm_roles(c)
 
 
+# --- ВЗАИМОРАСЧЕТЫ С КОМАНДОЙ ---
 @dp.callback_query(F.data == "adm_paylist")
 async def cb_adm_paylist(c: types.CallbackQuery):
   if not is_admin(c.from_user.id):
