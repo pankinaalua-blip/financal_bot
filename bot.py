@@ -120,10 +120,12 @@ def get_pay_period_from_str(date_str: str) -> str:
 
 
 def is_admin(uid: int) -> bool:
+  """Только пользователи из ADMIN_IDS имеют доступ к финансам, кассе и выплатам"""
   return uid in admins
 
 
 def is_staff_lead(uid: int) -> bool:
+  """Управляющие и админы имеют доступ только к табелю и согласованию смен"""
   return uid in admins or uid in managers
 
 
@@ -317,6 +319,7 @@ async def get_emp(user: types.User) -> str:
   return emp_cache.get(str(user.id)) or await asyncio.to_thread(get_employee_sync, user)
 
 
+# --- УЧЕТ СМЕН В ЛИСТЕ «СМЕНЫ» ---
 def log_shift_start_sync(shift_id: str, date_str: str, emp: str, start_dt: datetime, comment: str):
   try:
     ws = spreadsheet.worksheet("Смены")
@@ -372,6 +375,7 @@ def log_full_completed_shift_sync(shift_id: str, date_str: str, emp: str, start_
     print(f"Full retro shift log error: {e}")
 
 
+# --- КАССА ГЛАВНОГО УПРАВЛЯЮЩЕГО ---
 def get_admin_cash_summary_sync() -> dict:
   try:
     ws = spreadsheet.worksheet("Касса управляющего")
@@ -927,6 +931,7 @@ async def process_retro_comment(m: types.Message, state: FSMContext):
       IBtn(text="✅ Одобрить", callback_data=f"s_appr|{rid}"),
       IBtn(text="❌ Отклонить", callback_data=f"s_rej|{rid}"),
   ]])
+  # Смены могут одобрять и управляющие, и администраторы
   for lid in admins | managers:
     try:
       await bot.send_message(
@@ -1094,7 +1099,7 @@ async def cb_retro_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД
+# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД (УВЕДОМЛЕНИЯ СТРОГО В ADMIN_IDS)
 # =====================================================================
 
 
@@ -1120,6 +1125,7 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
       IBtn(text="✅ Одобрить 2 500 ₸", callback_data=f"ml_ok|{mid}"),
       IBtn(text="❌ Отклонить", callback_data=f"ml_no|{mid}"),
   ]])
+  # Управляющие исключены: отправка СТРОГО только администраторам
   for aid in admins:
     try:
       await bot.send_message(
@@ -1137,7 +1143,7 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
 @dp.callback_query(F.data.startswith(("ml_ok|", "ml_no|")))
 async def cb_meal_decision(c: types.CallbackQuery):
   if not is_admin(c.from_user.id):
-    return await c.answer("Финансовые запросы одобряет только Администратор!", show_alert=True)
+    return await c.answer("Финансовые запросы одобряет только Главный Администратор!", show_alert=True)
   await c.answer()
   act, mid = c.data.split("|")
   req = pending_meal_requests.pop(mid, None)
@@ -1165,7 +1171,7 @@ async def cb_meal_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ (F.photo БЕЗ БЛОКИРУЮЩИХ ФИЛЬТРОВ)
+# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ И ДАТЫ
 # =====================================================================
 
 
@@ -1308,6 +1314,7 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
           IBtn(text="✅ Одобрить", callback_data=f"tx_ok|{tx_id}"),
           IBtn(text="❌ Отклонить", callback_data=f"tx_no|{tx_id}"),
       ]])
+      # Согласование такси уходит только администраторам
       for aid in admins:
         try:
           await bot.send_message(
@@ -1373,7 +1380,7 @@ async def cb_taxi_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 9. ПАНЕЛЬ УПРАВЛЕНИЯ И ЛИЧНАЯ КАССА ГЛАВНОГО УПРАВЛЯЮЩЕГО
+# 9. ПАНЕЛЬ УПРАВЛЕНИЯ (ФИНАНСЫ ТОЛЬКО У АДМИНИСТРАТОРОВ)
 # =====================================================================
 
 
@@ -1409,6 +1416,7 @@ async def render_control_panel(target, uid: int):
         [IBtn(text="👥 Роли команды", callback_data="adm_roles"), IBtn(text="🔄 Формулы", callback_data="adm_fix")],
     ]
   else:
+    # Управляющий видит ТОЛЬКО контроль смен команды. Никаких финансов!
     header = (
         f"⚙️ <b>Панель Управляющего (Контроль смен)</b>\n━━━━━━━━━━━━━━\n"
         f"📅 Текущий период: <b>{cur_period}</b>\n"
@@ -1449,7 +1457,7 @@ async def cb_adm_fix(c: types.CallbackQuery):
   await c.message.answer("✅ Формулы, часы смен и расчетные периоды обновлены!")
 
 
-# --- ПОПОЛНЕНИЕ СОБСТВЕННОГО БАЛАНСА УПРАВЛЯЮЩЕГО ---
+# --- ПОПОЛНЕНИЕ БАЛАНСА КАССЫ ---
 @dp.callback_query(F.data == "adm_topup")
 async def cb_adm_topup(c: types.CallbackQuery, state: FSMContext):
   if not is_admin(c.from_user.id):
