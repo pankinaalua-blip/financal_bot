@@ -2,6 +2,7 @@ import asyncio
 import base64
 import calendar
 from datetime import date, datetime, timedelta
+import hashlib
 import io
 import json
 import os
@@ -80,7 +81,6 @@ pending_receipts = {}
 pending_shifts = {}
 pending_meal_requests = {}
 waiting_reqs = set()
-saved_files = set()
 last_gemini_error = ""
 
 MONTHS_RU = [
@@ -249,7 +249,7 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =====================================================================
-# 3. СИНХРОНИЗАЦИЯ, ИМЕНА И ПРИВЯЗКА К CHAT ID
+# 3. СИНХРОНИЗАЦИЯ, ИМЕНА И ПРОВЕРКА ДУБЛИКАТОВ ЧЕКОВ
 # =====================================================================
 
 
@@ -277,8 +277,71 @@ def get_chat_id_by_emp_sync(emp_name: str) -> str:
   return ""
 
 
+def check_duplicate_receipt_sync(file_hash: str, amount: float, merchant: str, fiscal_id: str = "") -> dict:
+  """
+  Проверяет наличие чека в листе «Операции».
+  Возвращает:
+    - {'is_duplicate': False} если чек новый
+    - {'is_duplicate': True, 'is_credited': True/False, 'tx_id': ..., 'status': ..., 'date': ..., 'emp': ...}
+  """
+  try:
+    ws = spreadsheet.worksheet("Операции")
+    rows = ws.get_all_values()[1:]
+    amount = float(amount)
+    merchant_clean = str(merchant).strip().lower()
+    fiscal_clean = str(fiscal_id).strip().lower() if fiscal_id else ""
+
+    for r in rows:
+      if len(r) < 9:
+        continue
+
+      status = r[8].strip()
+      status_lower = status.lower()
+      # «Зачислен» = К возмещению, Выплачено или На согласовании
+      is_credited = status_lower in ["к возмещению", "выплачено", "на согласовании"]
+
+      row_amt = parse_kzt(r[7])
+      comment = r[9].strip().lower() if len(r) > 9 else ""
+      row_hash = r[11].strip() if len(r) > 11 else ""
+
+      matched = False
+
+      # 1. Точное совпадение по хэшу файла (столбец L)
+      if file_hash and row_hash and file_hash == row_hash:
+        matched = True
+
+      # 2. Совпадение по фискальному номеру / номеру чека (ФП / заказ)
+      elif fiscal_clean and len(fiscal_clean) >= 4 and fiscal_clean in comment:
+        matched = True
+
+      # 3. Совпадение по сумме и названию заведения / сервиса
+      elif abs(row_amt - amount) < 0.01 and merchant_clean:
+        if merchant_clean in comment or (merchant_clean in ["яндекс go", "такси"] and "такси" in comment):
+          matched = True
+
+      if matched:
+        return {
+            "is_duplicate": True,
+            "is_credited": is_credited,
+            "status": status,
+            "tx_id": r[0].strip(),
+            "date": r[1].strip(),
+            "emp": r[3].strip(),
+            "amount": row_amt,
+        }
+  except Exception as e:
+    print(f"Check duplicate error: {e}")
+
+  return {"is_duplicate": False}
+
+
 def sync_roles_and_formulas():
   try:
+    ws_op = spreadsheet.worksheet("Операции")
+    op_headers = ws_op.row_values(1)
+    if len(op_headers) < 12 or not op_headers[11].strip():
+      ws_op.update_cell(1, 12, "Хэш чека")
+
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     pay_rows = ws_pay.get_all_values()
     ws_ref = spreadsheet.worksheet("Справочники")
@@ -288,7 +351,6 @@ def sync_roles_and_formulas():
     cur_period = get_pay_period(now_astana())
     batch_data = []
 
-    # Сбрасываем кэш имён, чтобы бот сразу читал свежие имена из таблицы
     emp_cache.clear()
 
     for idx, row in enumerate(pay_rows[1:], start=2):
@@ -337,7 +399,6 @@ def get_employee_sync(user: types.User) -> str:
   matched_name = None
 
   try:
-    # 1. ПРИОРИТЕТ 1: Ищем по Chat ID в листе «Выплаты команде» (столбец L = индекс 11)
     ws_pay = spreadsheet.worksheet("Выплаты команде")
     pay_rows = ws_pay.get_all_values()[1:]
     for r in pay_rows:
@@ -347,7 +408,6 @@ def get_employee_sync(user: types.User) -> str:
           matched_name = raw_name
           break
 
-    # 2. ПРИОРИТЕТ 2: Ищем в листе «Справочники»
     if not matched_name:
       ws_ref = spreadsheet.worksheet("Справочники")
       records = ws_ref.get_all_records()
@@ -364,7 +424,6 @@ def get_employee_sync(user: types.User) -> str:
             ws_ref.update_cell(idx, 3, uid)
             break
 
-    # 3. Если нового сотрудника ещё нет в таблице вообще — добавляем
     if not matched_name:
       matched_name = tg_display
       ws_ref = spreadsheet.worksheet("Справочники")
@@ -401,7 +460,7 @@ async def get_emp(user: types.User) -> str:
   return emp_cache.get(str(user.id)) or await asyncio.to_thread(get_employee_sync, user)
 
 
-# --- УЧЕТ СМЕН В ЛИСТЕ «СМЕНЫ» (СТОЛБЕЦ J: CHAT ID) ---
+# --- УЧЕТ СМЕН В ЛИСТЕ «СМЕНЫ» ---
 def log_shift_start_sync(shift_id: str, date_str: str, emp: str, start_dt: datetime, comment: str, chat_id: int | str = ""):
   try:
     ws = spreadsheet.worksheet("Смены")
@@ -520,10 +579,11 @@ def get_all_team_members_sync():
     return []
 
 
-# --- ОПЕРАЦИИ (СТОЛБЕЦ K: CHAT ID) ---
+# --- ОПЕРАЦИИ (СТОЛБЕЦ K: CHAT ID, СТОЛБЕЦ L: ХЭШ ЧЕКА) ---
 def add_operation_sync(
     calc_date: str, category: str, amount: float, employee: str,
-    comment: str, status: str = "К возмещению", drive_link: str = None, tx_id: str = None, chat_id: int | str = "",
+    comment: str, status: str = "К возмещению", drive_link: str = None,
+    tx_id: str = None, chat_id: int | str = "", file_hash: str = "",
 ):
   ws = spreadsheet.worksheet("Операции")
   tx = tx_id or f"TX-{random.randint(10000, 99999)}"
@@ -542,7 +602,11 @@ def add_operation_sync(
 
   cid_str = str(chat_id).strip() if chat_id else get_chat_id_by_emp_sync(employee)
   ws.append_row(
-      [tx, calc_date, period, employee, taxi_val, meals_val, other_val, f"=E{next_row}+F{next_row}+G{next_row}", status, check_cell, cid_str],
+      [
+          tx, calc_date, period, employee, taxi_val, meals_val, other_val,
+          f"=E{next_row}+F{next_row}+G{next_row}", status, check_cell,
+          cid_str, file_hash,
+      ],
       value_input_option="USER_ENTERED",
   )
 
@@ -882,7 +946,7 @@ async def msg_shift(m: types.Message):
     await m.answer(
         f"🟢 <b>Смена активна ({s['id']})</b>\n━━━━━━━━━━━━━━\n"
         f"📅 Дата: <b>{s['date']}</b>\n"
-        f"📝 Площадка: <i>{s['comment']}</i>\n"
+        f"📝 Площадка: <i>{comment}</i>\n" if (comment := s.get('comment')) else ""
         f"🕒 Старт: <b>{s['start'].strftime('%H:%M')}</b> (в работе: {h} ч. {mn} мин.)\n"
         f"⏰ Следующая проверка: {s['next_check'].strftime('%H:%M')}",
         reply_markup=IMarkup(inline_keyboard=btns), parse_mode="HTML",
@@ -1268,7 +1332,7 @@ async def cb_meal_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ И ДАТЫ
+# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ, OCR И ПРОВЕРКА ДУБЛИКАТОВ
 # =====================================================================
 
 
@@ -1298,15 +1362,15 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
     return await process_fast_expense_photo(m, state)
 
   await state.clear()
-
   photo = m.photo[-1]
-  if photo.file_unique_id in saved_files:
-    return await m.answer("⚠️ Этот чек уже был загружен ранее!")
 
   wait = await m.answer("🔍 <b>Сканирую чек и сохраняю на Диск...</b>", parse_mode="HTML")
   buf = io.BytesIO()
   await bot.download(photo, destination=buf)
   img_bytes = buf.getvalue()
+
+  # Вычисляем цифровой MD5-хэш самого файла изображения
+  file_hash = hashlib.md5(img_bytes).hexdigest()
 
   fname = f"check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
@@ -1318,10 +1382,11 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
 
   prompt = (
       "Распознай данные кассового чека или поездки такси на фото. "
-      "Найди итоговую сумму (ИТОГ / ВСЕГО / СУММА). "
+      "Найди итоговую сумму (ИТОГ / ВСЕГО / СУММА), продавца, а также фискальный признак (ФП / ФД / номер чека или номер заказа такси, если виден). "
       "Верни ТОЛЬКО валидный JSON без лишнего текста: "
-      '{"amount": число_суммы_без_пробелов, "merchant": "продавец или Яндекс Go", '
-      '"category": "Такси" или "Прочие расходы", "description": "кратко суть (2-4 слова)"}'
+      '{"amount": число_суммы_без_пробелов, "merchant": "название продавца или Яндекс Go", '
+      '"category": "Такси" или "Прочие расходы", "description": "кратко суть (2-4 слова)", '
+      '"fiscal_id": "номер чека, ФП или номер заказа такси, если есть, иначе пустая строка"}'
   )
 
   data = await ask_gemini([image_part, prompt], raw_bytes=img_bytes, prompt_str=prompt)
@@ -1337,11 +1402,33 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   merch = str(data.get("merchant", "Чек")).strip()
   cat = str(data.get("category", "Прочие расходы")).strip()
   desc = str(data.get("description", "")).strip()
+  fiscal_id = str(data.get("fiscal_id", "")).strip()
   emp = await get_emp(m.from_user)
+
+  # ПРОВЕРКА НА ДУБЛИКАТ В ТАБЛИЦЕ
+  dup_check = await asyncio.to_thread(check_duplicate_receipt_sync, file_hash, amt, merch, fiscal_id)
+  if dup_check.get("is_duplicate"):
+    # Если чек зачислен (К возмещению, Выплачено, На согласовании) — СТРОГО БЛОКИРУЕМ
+    if dup_check.get("is_credited"):
+      return await wait.edit_text(
+          f"❌ <b>Ошибка: этот чек уже был загружен и зачислен ранее!</b>\n━━━━━━━━━━━━━━\n"
+          f"📋 <b>Данные исходной записи:</b>\n"
+          f"• Операция: <code>{dup_check.get('tx_id')}</code> от <b>{dup_check.get('date')}</b>\n"
+          f"• Поставщик: <b>{merch}</b>\n"
+          f"• Сумма: <b>{amt:,.0f} ₸</b>\n"
+          f"• Сотрудник: <b>{dup_check.get('emp')}</b>\n"
+          f"• Текущий статус: <b>{dup_check.get('status')}</b>\n\n"
+          f"<blockquote>Повторное начисление одного и того же чека строго запрещено.</blockquote>",
+          parse_mode="HTML",
+      )
+    else:
+      # Если предыдущая попытка была «Отклонено» — разрешаем повторно
+      await m.answer("ℹ️ <i>Ранее этот чек был отклонен администратором. Отправляем на повторное рассмотрение.</i>", parse_mode="HTML")
 
   pending_receipts[m.from_user.id] = {
       "amount": amt, "merchant": merch, "category": cat,
-      "desc": desc, "emp": emp, "link": drive_url, "fid": photo.file_unique_id,
+      "desc": desc, "emp": emp, "link": drive_url,
+      "fid": photo.file_unique_id, "file_hash": file_hash,
   }
 
   now = now_astana()
@@ -1409,7 +1496,7 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
           add_operation_sync,
           label, "Такси", rec["amount"], rec["emp"],
           f"{rec['merchant']}: {rec['desc']} (Дневное такси)",
-          "На согласовании", rec["link"], tx_id, uid,
+          "На согласовании", rec["link"], tx_id, uid, rec.get("file_hash", ""),
       )
       kb = IMarkup(inline_keyboard=[[
           IBtn(text="✅ Одобрить", callback_data=f"tx_ok|{tx_id}"),
@@ -1432,9 +1519,9 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     await asyncio.to_thread(
         add_operation_sync,
         label, rec["category"], rec["amount"], rec["emp"],
-        f"{rec['merchant']}: {rec['desc']}", "К возмещению", rec["link"], None, uid,
+        f"{rec['merchant']}: {rec['desc']}", "К возмещению", rec["link"],
+        None, uid, rec.get("file_hash", ""),
     )
-    saved_files.add(rec["fid"])
     await c.message.edit_text(
         f"✅ <b>Расход внесен в таблицу!</b>\n━━━━━━━━━━━━━━\n"
         f"📂 Категория: <b>{rec['category']}</b>\n📅 Дата: <b>{label}</b>\n"
