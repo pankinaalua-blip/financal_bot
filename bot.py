@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import calendar
 from datetime import date, datetime, timedelta
 import io
@@ -22,6 +23,7 @@ from aiogram.types import (
     ReplyKeyboardMarkup as RMarkup,
 )
 from aiohttp import web
+import aiohttp
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
@@ -35,8 +37,11 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
-RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "").strip()
+DEFAULT_SHEET = "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA"
+DEFAULT_FOLDER = "13ze6D8nDnjGtZ7QDOQAr5iZnyrVnLcEH"
+
+SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or DEFAULT_SHEET).strip()
+RECEIPTS_FOLDER_ID = (os.getenv("RECEIPTS_FOLDER_ID") or DEFAULT_FOLDER).strip()
 
 ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or "disa2026").strip()
 MANAGER_PASSWORD = (os.getenv("MANAGER_PASSWORD") or "disa_manager").strip()
@@ -52,7 +57,11 @@ SHIFT_TIMEOUT_M = 30
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
-ai_client = genai.Client(api_key=GEMINI_KEY)
+
+ai_client = genai.Client(
+    api_key=GEMINI_KEY,
+    http_options={"api_version": "v1beta"}
+)
 
 gc = gspread.service_account(
     filename="credentials.json",
@@ -61,7 +70,7 @@ gc = gspread.service_account(
         "https://www.googleapis.com/auth/drive",
     ],
 )
-spreadsheet = gc.open_by_key(SPREADSHEET_ID) if SPREADSHEET_ID else gc.open("Финансовый учет — Аренда звука и света")
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
 
 admins = set(INITIAL_ADMINS)
 managers = set()
@@ -117,12 +126,10 @@ def get_pay_period_from_str(date_str: str) -> str:
 
 
 def is_admin(uid: int) -> bool:
-  """Финансовый доступ: строго только те, кто в ADMIN_IDS"""
   return uid in admins
 
 
 def is_staff_lead(uid: int) -> bool:
-  """Доступ к сменам: админы + управляющие"""
   return uid in admins or uid in managers
 
 
@@ -139,10 +146,39 @@ def parse_kzt(val: str) -> float:
 # =====================================================================
 
 
-async def ask_gemini(contents) -> dict | None:
+async def ask_gemini_direct_rest(img_bytes: bytes, prompt: str) -> dict | None:
+  b64 = base64.b64encode(img_bytes).decode("utf-8")
+  url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}"
+  payload = {
+      "contents": [{
+          "parts": [
+              {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+              {"text": prompt},
+          ]
+      }],
+      "generationConfig": {
+          "responseMimeType": "application/json",
+          "temperature": 0.1,
+      },
+  }
+  try:
+    async with aiohttp.ClientSession() as session:
+      async with session.post(url, json=payload, timeout=25) as resp:
+        if resp.status == 200:
+          data = await resp.json()
+          txt = data["candidates"][0]["content"]["parts"][0]["text"]
+          s, e = txt.find("{"), txt.rfind("}")
+          if s != -1 and e != -1:
+            return json.loads(txt[s : e + 1])
+  except Exception as e:
+    print(f"Direct REST Error: {e}")
+  return None
+
+
+async def ask_gemini(contents, raw_bytes: bytes = None, prompt_str: str = "") -> dict | None:
   global last_gemini_error
   last_gemini_error = ""
-  models = ["gemini-3.8-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
+  models = ["gemini-3.8-flash", "gemini-3.6-flash"]
   cfg = genai_types.GenerateContentConfig(
       response_mime_type="application/json",
       temperature=0.1,
@@ -161,10 +197,14 @@ async def ask_gemini(contents) -> dict | None:
         if start != -1 and end != -1:
           return json.loads(raw[start : end + 1])
     except Exception as e:
-      err_str = str(e)
-      last_gemini_error = f"[{m}] {err_str[:220]}"
-      print(f"❌ ОШИБКА GEMINI {last_gemini_error}")
-      await asyncio.sleep(0.5)
+      last_gemini_error = f"[{m}] {str(e)[:200]}"
+      print(f"❌ SDK Gemini Error: {last_gemini_error}")
+
+  if raw_bytes and prompt_str:
+    res = await ask_gemini_direct_rest(raw_bytes, prompt_str)
+    if res:
+      return res
+
   return None
 
 
@@ -209,8 +249,32 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =====================================================================
-# 3. СИНХРОНИЗАЦИЯ, ИМЕНА И ТАБЛИЦА
+# 3. СИНХРОНИЗАЦИЯ, ИМЕНА И ПРИВЯЗКА К CHAT ID
 # =====================================================================
+
+
+def get_chat_id_by_emp_sync(emp_name: str) -> str:
+  emp_clean = str(emp_name).strip().lower()
+  for uid, name in emp_cache.items():
+    if name.strip().lower() == emp_clean:
+      return str(uid)
+  try:
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    for r in ws_pay.get_all_values()[1:]:
+      if r and r[0].strip().lower() == emp_clean and len(r) >= 12:
+        cid = str(r[11]).strip()
+        if cid:
+          return cid
+
+    ws_ref = spreadsheet.worksheet("Справочники")
+    for r in ws_ref.get_all_records():
+      if str(r.get("Имя", "")).strip().lower() == emp_clean:
+        cid = str(r.get("Chat ID", "")).strip()
+        if cid:
+          return cid
+  except Exception as e:
+    print(f"Chat ID lookup error: {e}")
+  return ""
 
 
 def sync_roles_and_formulas():
@@ -224,6 +288,9 @@ def sync_roles_and_formulas():
     cur_period = get_pay_period(now_astana())
     batch_data = []
 
+    # Сбрасываем кэш имён, чтобы бот сразу читал свежие имена из таблицы
+    emp_cache.clear()
+
     for idx, row in enumerate(pay_rows[1:], start=2):
       if not row or not row[0].strip():
         continue
@@ -233,16 +300,17 @@ def sync_roles_and_formulas():
         mgr_names.add(name.lower())
 
       batch_data.append({
-          "range": f"D{idx}:K{idx}",
+          "range": f"D{idx}:L{idx}",
           "values": [[
-              f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "К возмещению")',
-              f'=SUMIFS(Операции!E:E; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")',
-              f'=SUMIFS(Операции!F:F; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")',
-              f'=SUMIFS(Операции!G:G; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению")',
+              f'=IF(L{idx}<>""; SUMIFS(Операции!H:H; Операции!K:K; L{idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "К возмещению"))',
+              f'=IF(L{idx}<>""; SUMIFS(Операции!E:E; Операции!K:K; L{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!E:E; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению"))',
+              f'=IF(L{idx}<>""; SUMIFS(Операции!F:F; Операции!K:K; L{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!F:F; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению"))',
+              f'=IF(L{idx}<>""; SUMIFS(Операции!G:G; Операции!K:K; L{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!G:G; Операции!D:D; A{idx}; Операции!C:C; J{idx}; Операции!I:I; "К возмещению"))',
               f"=E{idx}+F{idx}+G{idx}",
-              f'=SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "Выплачено")',
+              f'=IF(L{idx}<>""; SUMIFS(Операции!H:H; Операции!K:K; L{idx}; Операции!I:I; "Выплачено"); SUMIFS(Операции!H:H; Операции!D:D; A{idx}; Операции!I:I; "Выплачено"))',
               cur_period,
-              f"=SUMIFS('Смены'!G:G; 'Смены'!D:D; A{idx}; 'Смены'!C:C; J{idx})",
+              f'=IF(L{idx}<>""; SUMIFS(\'Смены\'!G:G; \'Смены\'!J:J; L{idx}; \'Смены\'!C:C; J{idx}); SUMIFS(\'Смены\'!G:G; \'Смены\'!D:D; A{idx}; \'Смены\'!C:C; J{idx}))',
+              f'=IFERROR(VLOOKUP(A{idx}; \'Справочники\'!A:C; 3; FALSE); "")',
           ]],
       })
 
@@ -269,27 +337,39 @@ def get_employee_sync(user: types.User) -> str:
   matched_name = None
 
   try:
-    ws_ref = spreadsheet.worksheet("Справочники")
-    records = ws_ref.get_all_records()
-
-    for r in records:
-      if str(r.get("Chat ID", "")).strip() == uid:
-        matched_name = str(r.get("Имя", "")).strip()
-        break
-
-    if not matched_name and uname:
-      for r in records:
-        if str(r.get("Telegram никнейм", "")).strip().lower() == uname:
-          matched_name = str(r.get("Имя", "")).strip()
-          idx = records.index(r) + 2
-          ws_ref.update_cell(idx, 3, uid)
+    # 1. ПРИОРИТЕТ 1: Ищем по Chat ID в листе «Выплаты команде» (столбец L = индекс 11)
+    ws_pay = spreadsheet.worksheet("Выплаты команде")
+    pay_rows = ws_pay.get_all_values()[1:]
+    for r in pay_rows:
+      if len(r) >= 12 and str(r[11]).strip() == uid:
+        raw_name = str(r[0]).strip()
+        if raw_name:
+          matched_name = raw_name
           break
 
+    # 2. ПРИОРИТЕТ 2: Ищем в листе «Справочники»
+    if not matched_name:
+      ws_ref = spreadsheet.worksheet("Справочники")
+      records = ws_ref.get_all_records()
+      for r in records:
+        if str(r.get("Chat ID", "")).strip() == uid:
+          matched_name = str(r.get("Имя", "")).strip()
+          break
+
+      if not matched_name and uname:
+        for r in records:
+          if str(r.get("Telegram никнейм", "")).strip().lower() == uname:
+            matched_name = str(r.get("Имя", "")).strip()
+            idx = records.index(r) + 2
+            ws_ref.update_cell(idx, 3, uid)
+            break
+
+    # 3. Если нового сотрудника ещё нет в таблице вообще — добавляем
     if not matched_name:
       matched_name = tg_display
+      ws_ref = spreadsheet.worksheet("Справочники")
       ws_ref.append_row([matched_name, f"@{user.username}" if user.username else "-", uid])
 
-    ws_pay = spreadsheet.worksheet("Выплаты команде")
     existing_names = [x.strip().lower() for x in ws_pay.col_values(1)]
     if matched_name.lower() not in existing_names:
       r_idx = len(existing_names) + 1
@@ -297,14 +377,15 @@ def get_employee_sync(user: types.User) -> str:
       ws_pay.append_row(
           [
               matched_name, "Команда", "-",
-              f'=SUMIFS(Операции!H:H; Операции!D:D; A{r_idx}; Операции!I:I; "К возмещению")',
-              f'=SUMIFS(Операции!E:E; Операции!D:D; A{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению")',
-              f'=SUMIFS(Операции!F:F; Операции!D:D; A{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению")',
-              f'=SUMIFS(Операции!G:G; Операции!D:D; A{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению")',
+              f'=IF(L{r_idx}<>""; SUMIFS(Операции!H:H; Операции!K:K; L{r_idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!H:H; Операции!D:D; A{r_idx}; Операции!I:I; "К возмещению"))',
+              f'=IF(L{r_idx}<>""; SUMIFS(Операции!E:E; Операции!K:K; L{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!E:E; Операции!D:D; A{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению"))',
+              f'=IF(L{r_idx}<>""; SUMIFS(Операции!F:F; Операции!K:K; L{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!F:F; Операции!D:D; A{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению"))',
+              f'=IF(L{r_idx}<>""; SUMIFS(Операции!G:G; Операции!K:K; L{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению"); SUMIFS(Операции!G:G; Операции!D:D; A{r_idx}; Операции!C:C; J{r_idx}; Операции!I:I; "К возмещению"))',
               f"=E{r_idx}+F{r_idx}+G{r_idx}",
-              f'=SUMIFS(Операции!H:H; Операции!D:D; A{r_idx}; Операции!I:I; "Выплачено")',
+              f'=IF(L{r_idx}<>""; SUMIFS(Операции!H:H; Операции!K:K; L{r_idx}; Операции!I:I; "Выплачено"); SUMIFS(Операции!H:H; Операции!D:D; A{r_idx}; Операции!I:I; "Выплачено"))',
               cur_period,
-              f"=SUMIFS('Смены'!G:G; 'Смены'!D:D; A{r_idx}; 'Смены'!C:C; J{r_idx})",
+              f'=IF(L{r_idx}<>""; SUMIFS(\'Смены\'!G:G; \'Смены\'!J:J; L{r_idx}; \'Смены\'!C:C; J{r_idx}); SUMIFS(\'Смены\'!G:G; \'Смены\'!D:D; A{r_idx}; \'Смены\'!C:C; J{r_idx}))',
+              uid,
           ],
           value_input_option="USER_ENTERED",
       )
@@ -320,15 +401,16 @@ async def get_emp(user: types.User) -> str:
   return emp_cache.get(str(user.id)) or await asyncio.to_thread(get_employee_sync, user)
 
 
-# --- УЧЕТ СМЕН В ЛИСТЕ «СМЕНЫ» ---
-def log_shift_start_sync(shift_id: str, date_str: str, emp: str, start_dt: datetime, comment: str):
+# --- УЧЕТ СМЕН В ЛИСТЕ «СМЕНЫ» (СТОЛБЕЦ J: CHAT ID) ---
+def log_shift_start_sync(shift_id: str, date_str: str, emp: str, start_dt: datetime, comment: str, chat_id: int | str = ""):
   try:
     ws = spreadsheet.worksheet("Смены")
     period = get_pay_period_from_str(date_str)
+    cid_str = str(chat_id).strip() if chat_id else get_chat_id_by_emp_sync(emp)
     ws.append_row(
         [
             shift_id, date_str, period, emp,
-            start_dt.strftime("%H:%M"), "—", 0, comment, "В работе",
+            start_dt.strftime("%H:%M"), "—", 0, comment, "В работе", cid_str,
         ],
         value_input_option="USER_ENTERED",
     )
@@ -356,7 +438,7 @@ def log_shift_end_sync(shift_id: str, end_dt: datetime, hours_worked: float, aut
     print(f"Shift end log error: {e}")
 
 
-def log_full_completed_shift_sync(shift_id: str, date_str: str, emp: str, start_dt: datetime, end_dt: datetime, comment: str):
+def log_full_completed_shift_sync(shift_id: str, date_str: str, emp: str, start_dt: datetime, end_dt: datetime, comment: str, chat_id: int | str = ""):
   try:
     ws = spreadsheet.worksheet("Смены")
     period = get_pay_period_from_str(date_str)
@@ -364,11 +446,12 @@ def log_full_completed_shift_sync(shift_id: str, date_str: str, emp: str, start_
       end_dt += timedelta(days=1)
     dur = max(timedelta(0), end_dt - start_dt)
     hours_worked = round(dur.total_seconds() / 3600.0, 2)
+    cid_str = str(chat_id).strip() if chat_id else get_chat_id_by_emp_sync(emp)
     ws.append_row(
         [
             shift_id, date_str, period, emp,
             start_dt.strftime("%H:%M"), end_dt.strftime("%H:%M"),
-            hours_worked, comment, "Завершена",
+            hours_worked, comment, "Завершена", cid_str,
         ],
         value_input_option="USER_ENTERED",
     )
@@ -437,9 +520,10 @@ def get_all_team_members_sync():
     return []
 
 
+# --- ОПЕРАЦИИ (СТОЛБЕЦ K: CHAT ID) ---
 def add_operation_sync(
     calc_date: str, category: str, amount: float, employee: str,
-    comment: str, status: str = "К возмещению", drive_link: str = None, tx_id: str = None,
+    comment: str, status: str = "К возмещению", drive_link: str = None, tx_id: str = None, chat_id: int | str = "",
 ):
   ws = spreadsheet.worksheet("Операции")
   tx = tx_id or f"TX-{random.randint(10000, 99999)}"
@@ -455,35 +539,48 @@ def add_operation_sync(
     check_cell = f'=HYPERLINK("{drive_link}"; "📎 Открыть чек")'
   else:
     check_cell = safe_comment if safe_comment else "Без чека"
+
+  cid_str = str(chat_id).strip() if chat_id else get_chat_id_by_emp_sync(employee)
   ws.append_row(
-      [tx, calc_date, period, employee, taxi_val, meals_val, other_val, f"=E{next_row}+F{next_row}+G{next_row}", status, check_cell],
+      [tx, calc_date, period, employee, taxi_val, meals_val, other_val, f"=E{next_row}+F{next_row}+G{next_row}", status, check_cell, cid_str],
       value_input_option="USER_ENTERED",
   )
 
 
-def get_debts_sync(filter_emp: str = None):
+def get_debts_sync(filter_emp: str = None, filter_uid: int | str = None):
   rows = spreadsheet.worksheet("Операции").get_all_values()[1:]
   debts = {}
   items = []
+  target_cid = str(filter_uid).strip() if filter_uid else ""
+  target_name = filter_emp.strip().lower() if filter_emp else ""
+
   for r in rows:
     if len(r) < 9 or "к возмещению" not in r[8].strip().lower():
       continue
     who = r[3].strip()
-    if not who:
+    row_cid = str(r[10]).strip() if len(r) > 10 else ""
+    if not who and not row_cid:
       continue
     taxi_amt = parse_kzt(r[4])
     meal_amt = parse_kzt(r[5])
     other_amt = parse_kzt(r[6])
     total_row = parse_kzt(r[7]) if len(r) > 7 and str(r[7]).strip() else (taxi_amt + meal_amt + other_amt)
     debts[who] = debts.get(who, 0.0) + total_row
-    if filter_emp and who.lower() == filter_emp.strip().lower():
+
+    matches = False
+    if target_cid and row_cid:
+      matches = (row_cid == target_cid)
+    elif target_name and who:
+      matches = (who.lower() == target_name)
+
+    if matches:
       cat = "Такси" if taxi_amt != 0 else ("Обеденные" if meal_amt != 0 else "Прочие расходы")
       items.append({"date": r[1], "cat": cat, "amount": total_row, "comment": r[9] if len(r) > 9 else "-"})
   return debts, items
 
 
 # =====================================================================
-# 4. КЛАВИАТУРЫ И КАЛЕНДАРЬ
+# 4. ДИНАМИЧЕСКИЕ КЛАВИАТУРЫ И КАЛЕНДАРЬ
 # =====================================================================
 
 
@@ -629,7 +726,7 @@ async def cmd_manager(m: types.Message):
 async def msg_balance(m: types.Message):
   wait = await m.answer("⏳ Загружаю баланс...")
   name = await get_emp(m.from_user)
-  debts, items = await asyncio.to_thread(get_debts_sync, name)
+  debts, items = await asyncio.to_thread(get_debts_sync, name, m.from_user.id)
   team_members = await asyncio.to_thread(get_all_team_members_sync)
   hrs = next((h for k, _, h in team_members if k.lower() == name.lower()), 0.0)
 
@@ -839,7 +936,7 @@ async def process_shift_comment(m: types.Message, state: FSMContext):
       "id": shift_id, "date": data["date"], "start": now, "emp": emp,
       "comment": comment, "next_check": nxt, "waiting": False, "prompt_at": None,
   }
-  await asyncio.to_thread(log_shift_start_sync, shift_id, data["date"], emp, now, comment)
+  await asyncio.to_thread(log_shift_start_sync, shift_id, data["date"], emp, now, comment, m.from_user.id)
 
   await m.answer(
       f"🟢 <b>Смена начата и внесена в таблицу!</b>\n━━━━━━━━━━━━━━\n"
@@ -1061,7 +1158,7 @@ async def cb_retro_decision(c: types.CallbackQuery):
         "comment": req["comment"], "next_check": next_check,
         "waiting": False, "prompt_at": None,
     }
-    await asyncio.to_thread(log_shift_start_sync, shift_id, req["date"], req["emp"], start_time, req["comment"])
+    await asyncio.to_thread(log_shift_start_sync, shift_id, req["date"], req["emp"], start_time, req["comment"], req["uid"])
 
     await c.message.edit_text(f"✅ Старт смены <b>{req['emp']}</b> одобрен!", parse_mode="HTML")
     try:
@@ -1075,7 +1172,7 @@ async def cb_retro_decision(c: types.CallbackQuery):
 
   elif act == "s_appr_full":
     shift_id = f"SH-{random.randint(10000, 99999)}"
-    await asyncio.to_thread(log_full_completed_shift_sync, shift_id, req["date"], req["emp"], req["start"], req["end"], req["comment"])
+    await asyncio.to_thread(log_full_completed_shift_sync, shift_id, req["date"], req["emp"], req["start"], req["end"], req["comment"], req["uid"])
     
     dur = max(timedelta(0), req["end"] - req["start"])
     hrs = dur.total_seconds() / 3600.0
@@ -1125,7 +1222,6 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
       IBtn(text="✅ Одобрить 2 500 ₸", callback_data=f"ml_ok|{mid}"),
       IBtn(text="❌ Отклонить", callback_data=f"ml_no|{mid}"),
   ]])
-  # Управляющим ничего не приходит: отправка строго администраторам по ID
   for aid in admins:
     try:
       await bot.send_message(
@@ -1156,6 +1252,7 @@ async def cb_meal_decision(c: types.CallbackQuery):
         add_operation_sync,
         req["date"], "Обеденные", 2500, req["emp"],
         f"{req['comment']} (Одобрил: {approver})", "К возмещению",
+        chat_id=req["uid"],
     )
     await c.message.edit_text(f"✅ Обед для <b>{req['emp']}</b> (2 500 ₸) одобрен и зачислен!", parse_mode="HTML")
     try:
@@ -1227,7 +1324,7 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
       '"category": "Такси" или "Прочие расходы", "description": "кратко суть (2-4 слова)"}'
   )
 
-  data = await ask_gemini([image_part, prompt])
+  data = await ask_gemini([image_part, prompt], raw_bytes=img_bytes, prompt_str=prompt)
   if not data or not data.get("amount"):
     err_detail = f"\n\n<code>{last_gemini_error}</code>" if last_gemini_error else ""
     return await wait.edit_text(
@@ -1312,7 +1409,7 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
           add_operation_sync,
           label, "Такси", rec["amount"], rec["emp"],
           f"{rec['merchant']}: {rec['desc']} (Дневное такси)",
-          "На согласовании", rec["link"], tx_id,
+          "На согласовании", rec["link"], tx_id, uid,
       )
       kb = IMarkup(inline_keyboard=[[
           IBtn(text="✅ Одобрить", callback_data=f"tx_ok|{tx_id}"),
@@ -1335,7 +1432,7 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     await asyncio.to_thread(
         add_operation_sync,
         label, rec["category"], rec["amount"], rec["emp"],
-        f"{rec['merchant']}: {rec['desc']}", "К возмещению", rec["link"],
+        f"{rec['merchant']}: {rec['desc']}", "К возмещению", rec["link"], None, uid,
     )
     saved_files.add(rec["fid"])
     await c.message.edit_text(
@@ -1456,7 +1553,7 @@ async def cb_adm_fix(c: types.CallbackQuery):
     return await c.answer("Доступно только Администратору!", show_alert=True)
   await c.answer("Синхронизирую формулы...")
   await asyncio.to_thread(sync_roles_and_formulas)
-  await c.message.answer("✅ Формулы, часы смен и расчетные периоды обновлены!")
+  await c.message.answer("✅ Формулы, часы смен и расчетные периоды обновлены, кэш имён сброшен!")
 
 
 # --- ПОПОЛНЕНИЕ БАЛАНСА КАССЫ ---
@@ -1543,7 +1640,7 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
       '"desc": "продавец и суть (2-5 слов)"}'
   )
 
-  res = await ask_gemini([image_part, prompt])
+  res = await ask_gemini([image_part, prompt], raw_bytes=img_bytes, prompt_str=prompt)
   if not res:
     res = {"amount": 0, "category": "Прочее", "desc": caption or "Чек управляющего"}
 
@@ -1583,7 +1680,7 @@ async def process_fast_expense(m: types.Message, state: FSMContext):
       '{"amount": число, "category": "Такси" | "Оборудование и расходники" | "Питание" | "Прочее", '
       '"desc": "суть"}'
   )
-  res = await ask_gemini(prompt) or {"amount": 0, "category": "Прочее", "desc": m.text}
+  res = await ask_gemini([prompt], prompt_str=prompt) or {"amount": 0, "category": "Прочее", "desc": m.text}
   amt = float(res.get("amount", 0))
   cat = res.get("category", "Прочее")
   if cat not in ("Такси", "Оборудование и расходники", "Питание", "Прочее"):
@@ -1776,11 +1873,12 @@ async def process_advance_amount(m: types.Message, state: FSMContext):
   await state.clear()
 
   now_str = now_astana().strftime("%d.%m.%Y")
+  cid = get_chat_id_by_emp_sync(emp)
   await asyncio.to_thread(
       add_operation_sync,
       now_str, "Прочие расходы", -advance_val, emp,
       f"Средства на расходы (выдал: {m.from_user.full_name or 'Администратор'})",
-      "К возмещению",
+      "К возмещению", None, None, cid,
   )
 
   await m.answer(
@@ -1795,9 +1893,13 @@ async def process_advance_amount(m: types.Message, state: FSMContext):
 
 def settle_payout_sync(emp: str, paid: float, debt: float):
   ws = spreadsheet.worksheet("Операции")
+  emp_cid = get_chat_id_by_emp_sync(emp)
   for idx, r in enumerate(ws.get_all_values()[1:], start=2):
-    if len(r) >= 9 and r[3].strip().lower() == emp.strip().lower() and "к возмещению" in r[8].lower():
-      ws.update_cell(idx, 9, "Выплачено")
+    if len(r) >= 9 and "к возмещению" in r[8].lower():
+      row_who = r[3].strip().lower()
+      row_cid = str(r[10]).strip() if len(r) > 10 else ""
+      if (emp_cid and row_cid == emp_cid) or (row_who == emp.strip().lower()):
+        ws.update_cell(idx, 9, "Выплачено")
 
   diff = paid - debt
   if abs(diff) > 0.01:
@@ -1806,7 +1908,7 @@ def settle_payout_sync(emp: str, paid: float, debt: float):
         f"Подотчет / переплата (выплачено {paid:,.0f} при долге {debt:,.0f})"
         if diff > 0 else f"Остаток долга (выплачено {paid:,.0f} из {debt:,.0f})"
     )
-    add_operation_sync(now_astana().strftime("%d.%m.%Y"), "Прочие расходы", amt, emp, note, "К возмещению")
+    add_operation_sync(now_astana().strftime("%d.%m.%Y"), "Прочие расходы", amt, emp, note, "К возмещению", chat_id=emp_cid)
 
 
 @dp.callback_query(F.data == "pay_exact")
