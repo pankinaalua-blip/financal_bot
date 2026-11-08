@@ -26,7 +26,6 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai import types as genai_types
 import gspread
-from PIL import Image
 
 # =====================================================================
 # 1. КОНФИГУРАЦИЯ
@@ -36,11 +35,8 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-DEFAULT_SHEET = "1IjR1yXggPyOiziDKMiQ7GJSijbc8bVbxuMiKCnUGYAA"
-DEFAULT_FOLDER = "13ze6D8nDnjGtZ7QDOQAr5iZnyrVnLcEH"
-
-SPREADSHEET_ID = (os.getenv("SPREADSHEET_ID") or DEFAULT_SHEET).strip()
-RECEIPTS_FOLDER_ID = (os.getenv("RECEIPTS_FOLDER_ID") or DEFAULT_FOLDER).strip()
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
+RECEIPTS_FOLDER_ID = os.getenv("RECEIPTS_FOLDER_ID", "").strip()
 
 ADMIN_PASSWORD = (os.getenv("ADMIN_PASSWORD") or "disa2026").strip()
 MANAGER_PASSWORD = (os.getenv("MANAGER_PASSWORD") or "disa_manager").strip()
@@ -65,7 +61,7 @@ gc = gspread.service_account(
         "https://www.googleapis.com/auth/drive",
     ],
 )
-spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+spreadsheet = gc.open_by_key(SPREADSHEET_ID) if SPREADSHEET_ID else gc.open("Финансовый учет — Аренда звука и света")
 
 admins = set(INITIAL_ADMINS)
 managers = set()
@@ -76,6 +72,7 @@ pending_shifts = {}
 pending_meal_requests = {}
 waiting_reqs = set()
 saved_files = set()
+last_gemini_error = ""
 
 MONTHS_RU = [
     "", "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -120,12 +117,12 @@ def get_pay_period_from_str(date_str: str) -> str:
 
 
 def is_admin(uid: int) -> bool:
-  """Только пользователи из ADMIN_IDS имеют доступ к финансам, кассе и выплатам"""
+  """Финансовый доступ: строго только те, кто в ADMIN_IDS"""
   return uid in admins
 
 
 def is_staff_lead(uid: int) -> bool:
-  """Управляющие и админы имеют доступ только к табелю и согласованию смен"""
+  """Доступ к сменам: админы + управляющие"""
   return uid in admins or uid in managers
 
 
@@ -138,17 +135,19 @@ def parse_kzt(val: str) -> float:
 
 
 # =====================================================================
-# 2. ИИ (GEMINI + PILLOW) И GOOGLE ДИСК
+# 2. ИИ (GEMINI OCR) И GOOGLE ДИСК
 # =====================================================================
 
 
 async def ask_gemini(contents) -> dict | None:
+  global last_gemini_error
+  last_gemini_error = ""
   models = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"]
   cfg = genai_types.GenerateContentConfig(
       response_mime_type="application/json",
       temperature=0.1,
   )
-  for idx, m in enumerate(models):
+  for m in models:
     try:
       resp = await ai_client.aio.models.generate_content(
           model=m,
@@ -162,7 +161,9 @@ async def ask_gemini(contents) -> dict | None:
         if start != -1 and end != -1:
           return json.loads(raw[start : end + 1])
     except Exception as e:
-      print(f"❌ Gemini Error on [{m}]: {e}")
+      err_str = str(e)
+      last_gemini_error = f"[{m}] {err_str[:220]}"
+      print(f"❌ ОШИБКА GEMINI {last_gemini_error}")
       await asyncio.sleep(0.5)
   return None
 
@@ -931,7 +932,6 @@ async def process_retro_comment(m: types.Message, state: FSMContext):
       IBtn(text="✅ Одобрить", callback_data=f"s_appr|{rid}"),
       IBtn(text="❌ Отклонить", callback_data=f"s_rej|{rid}"),
   ]])
-  # Смены могут одобрять и управляющие, и администраторы
   for lid in admins | managers:
     try:
       await bot.send_message(
@@ -1125,7 +1125,7 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
       IBtn(text="✅ Одобрить 2 500 ₸", callback_data=f"ml_ok|{mid}"),
       IBtn(text="❌ Отклонить", callback_data=f"ml_no|{mid}"),
   ]])
-  # Управляющие исключены: отправка СТРОГО только администраторам
+  # Управляющим ничего не приходит: отправка строго администраторам по ID
   for aid in admins:
     try:
       await bot.send_message(
@@ -1214,28 +1214,32 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   fname = f"check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
 
-  buf.seek(0)
-  pil_img = Image.open(buf)
-
-  prompt = (
-      "Распознай данные чека или скриншота такси. Верни ТОЛЬКО JSON: "
-      '{"amount": число_суммы_без_пробелов, "merchant": "продавец или Яндекс Go", '
-      '"category": "Такси" или "Прочие расходы", '
-      '"description": "кратко суть (2-4 слова)"}'
+  image_part = genai_types.Part.from_bytes(
+      data=img_bytes,
+      mime_type="image/jpeg",
   )
 
-  data = await ask_gemini([pil_img, prompt])
+  prompt = (
+      "Распознай данные кассового чека или поездки такси на фото. "
+      "Найди итоговую сумму (ИТОГ / ВСЕГО / СУММА). "
+      "Верни ТОЛЬКО валидный JSON без лишнего текста: "
+      '{"amount": число_суммы_без_пробелов, "merchant": "продавец или Яндекс Go", '
+      '"category": "Такси" или "Прочие расходы", "description": "кратко суть (2-4 слова)"}'
+  )
+
+  data = await ask_gemini([image_part, prompt])
   if not data or not data.get("amount"):
+    err_detail = f"\n\n<code>{last_gemini_error}</code>" if last_gemini_error else ""
     return await wait.edit_text(
-        "⚠️ <b>Не удалось распознать сумму на чеке.</b>\n"
-        "Убедитесь, что фото четкое, и отправьте изображение еще раз.",
+        f"⚠️ <b>Не удалось распознать сумму на чеке.</b>\n"
+        f"Убедитесь, что фото четкое, и отправьте изображение еще раз.{err_detail}",
         parse_mode="HTML",
     )
 
   amt = float(data.get("amount", 0))
-  merch = data.get("merchant", "Чек")
-  cat = data.get("category", "Прочие расходы")
-  desc = data.get("description", "")
+  merch = str(data.get("merchant", "Чек")).strip()
+  cat = str(data.get("category", "Прочие расходы")).strip()
+  desc = str(data.get("description", "")).strip()
   emp = await get_emp(m.from_user)
 
   pending_receipts[m.from_user.id] = {
@@ -1314,7 +1318,6 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
           IBtn(text="✅ Одобрить", callback_data=f"tx_ok|{tx_id}"),
           IBtn(text="❌ Отклонить", callback_data=f"tx_no|{tx_id}"),
       ]])
-      # Согласование такси уходит только администраторам
       for aid in admins:
         try:
           await bot.send_message(
@@ -1416,7 +1419,6 @@ async def render_control_panel(target, uid: int):
         [IBtn(text="👥 Роли команды", callback_data="adm_roles"), IBtn(text="🔄 Формулы", callback_data="adm_fix")],
     ]
   else:
-    # Управляющий видит ТОЛЬКО контроль смен команды. Никаких финансов!
     header = (
         f"⚙️ <b>Панель Управляющего (Контроль смен)</b>\n━━━━━━━━━━━━━━\n"
         f"📅 Текущий период: <b>{cur_period}</b>\n"
@@ -1528,8 +1530,10 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
   fname = f"admin_check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
 
-  buf.seek(0)
-  pil_img = Image.open(buf)
+  image_part = genai_types.Part.from_bytes(
+      data=img_bytes,
+      mime_type="image/jpeg",
+  )
 
   caption = m.caption or ""
   prompt_addon = f' Учти комментарий: "{caption}".' if caption else ""
@@ -1539,7 +1543,7 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
       '"desc": "продавец и суть (2-5 слов)"}'
   )
 
-  res = await ask_gemini([pil_img, prompt])
+  res = await ask_gemini([image_part, prompt])
   if not res:
     res = {"amount": 0, "category": "Прочее", "desc": caption or "Чек управляющего"}
 
