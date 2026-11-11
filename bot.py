@@ -55,6 +55,7 @@ INITIAL_ADMINS = [
 TZ_ASTANA = ZoneInfo("Asia/Almaty")
 SHIFT_INTERVAL_H = 6
 SHIFT_TIMEOUT_M = 30
+MEAL_AMOUNT = 2500.0
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -89,8 +90,8 @@ MONTHS_RU = [
 ]
 
 NAV_BTNS = {
-    "⏱ Моя смена", "🔴 Завершить смену", "🍔 Запросить обед", "🚕 Такси",
-    "🧾 Прочие расходы", "💰 Мой баланс", "💳 Реквизиты", "⚙️ Управление",
+    "⚙️ Управление", "⏱ Моя смена", "🔴 Завершить смену", "🍔 Запросить обед",
+    "🚕 Такси", "🧾 Прочие расходы", "💰 Мой баланс", "💳 Реквизиты",
 }
 
 
@@ -178,7 +179,7 @@ async def ask_gemini_direct_rest(img_bytes: bytes, prompt: str) -> dict | None:
 async def ask_gemini(contents, raw_bytes: bytes = None, prompt_str: str = "") -> dict | None:
   global last_gemini_error
   last_gemini_error = ""
-  models = ["gemini-3.8-flash", "gemini-3.6-flash"]
+  models = ["gemini-2.0-flash", "gemini-1.5-flash"]
   cfg = genai_types.GenerateContentConfig(
       response_mime_type="application/json",
       temperature=0.1,
@@ -249,7 +250,7 @@ def upload_to_drive_sync(file_bytes: bytes, filename: str) -> str | None:
 
 
 # =====================================================================
-# 3. СИНХРОНИЗАЦИЯ, ИМЕНА И ПРОВЕРКА ДУБЛИКАТОВ ЧЕКОВ
+# 3. СИНХРОНИЗАЦИЯ, ИМЕНА И ПРОВЕРКА ДУБЛИКАТОВ
 # =====================================================================
 
 
@@ -277,13 +278,24 @@ def get_chat_id_by_emp_sync(emp_name: str) -> str:
   return ""
 
 
+def has_meal_for_date_sync(chat_id: int | str, date_str: str) -> bool:
+  try:
+    ws = spreadsheet.worksheet("Операции")
+    cid_str = str(chat_id).strip()
+    target_date = str(date_str).strip()
+    for r in ws.get_all_values()[1:]:
+      if len(r) >= 11 and str(r[1]).strip() == target_date:
+        row_cid = str(r[10]).strip()
+        meal_amt = parse_kzt(r[5])
+        status = str(r[8]).strip().lower()
+        if row_cid == cid_str and meal_amt > 0 and status in ["к возмещению", "выплачено", "на согласовании"]:
+          return True
+  except Exception as e:
+    print(f"Check meal error: {e}")
+  return False
+
+
 def check_duplicate_receipt_sync(file_hash: str, amount: float, merchant: str, fiscal_id: str = "") -> dict:
-  """
-  Проверяет наличие чека в листе «Операции».
-  Возвращает:
-    - {'is_duplicate': False} если чек новый
-    - {'is_duplicate': True, 'is_credited': True/False, 'tx_id': ..., 'status': ..., 'date': ..., 'emp': ...}
-  """
   try:
     ws = spreadsheet.worksheet("Операции")
     rows = ws.get_all_values()[1:]
@@ -297,7 +309,6 @@ def check_duplicate_receipt_sync(file_hash: str, amount: float, merchant: str, f
 
       status = r[8].strip()
       status_lower = status.lower()
-      # «Зачислен» = К возмещению, Выплачено или На согласовании
       is_credited = status_lower in ["к возмещению", "выплачено", "на согласовании"]
 
       row_amt = parse_kzt(r[7])
@@ -305,16 +316,10 @@ def check_duplicate_receipt_sync(file_hash: str, amount: float, merchant: str, f
       row_hash = r[11].strip() if len(r) > 11 else ""
 
       matched = False
-
-      # 1. Точное совпадение по хэшу файла (столбец L)
       if file_hash and row_hash and file_hash == row_hash:
         matched = True
-
-      # 2. Совпадение по фискальному номеру / номеру чека (ФП / заказ)
       elif fiscal_clean and len(fiscal_clean) >= 4 and fiscal_clean in comment:
         matched = True
-
-      # 3. Совпадение по сумме и названию заведения / сервиса
       elif abs(row_amt - amount) < 0.01 and merchant_clean:
         if merchant_clean in comment or (merchant_clean in ["яндекс go", "такси"] and "такси" in comment):
           matched = True
@@ -477,11 +482,11 @@ def log_shift_start_sync(shift_id: str, date_str: str, emp: str, start_dt: datet
     print(f"Shift start log error: {e}")
 
 
-def log_shift_end_sync(shift_id: str, end_dt: datetime, hours_worked: float, auto: bool = False):
+def log_shift_end_sync(shift_id: str, end_dt: datetime, hours_worked: float, auto: bool = False, custom_status: str = None):
   try:
     ws = spreadsheet.worksheet("Смены")
     rows = ws.get_all_values()
-    status = "Автозакрытие" if auto else "Завершена"
+    status = custom_status or ("Автозакрытие" if auto else "Завершена")
     h_val = round(hours_worked, 2)
     for idx, r in enumerate(rows[1:], start=2):
       if r and r[0].strip() == shift_id:
@@ -650,13 +655,15 @@ def get_debts_sync(filter_emp: str = None, filter_uid: int | str = None):
 
 def main_kb(uid: int) -> RMarkup:
   shift_btn = KBtn(text="🔴 Завершить смену") if uid in active_shifts else KBtn(text="⏱ Моя смена")
-  kb = [
+  kb = []
+  # Для управляющего и админа кнопка «⚙️ Управление» ВСЕГДА стоит на первой строке
+  if is_staff_lead(uid):
+    kb.append([KBtn(text="⚙️ Управление")])
+  kb.extend([
       [shift_btn, KBtn(text="🍔 Запросить обед")],
       [KBtn(text="🚕 Такси"), KBtn(text="🧾 Прочие расходы")],
       [KBtn(text="💰 Мой баланс"), KBtn(text="💳 Реквизиты")],
-  ]
-  if is_staff_lead(uid):
-    kb.append([KBtn(text="⚙️ Управление")])
+  ])
   return RMarkup(keyboard=kb, resize_keyboard=True)
 
 
@@ -727,7 +734,9 @@ async def cancel_active_fsm_on_nav(m: types.Message, state: FSMContext):
   await state.clear()
   waiting_reqs.discard(m.from_user.id)
   if m.text in NAV_BTNS:
-    if m.text == "⏱ Моя смена":
+    if m.text == "⚙️ Управление":
+      await cmd_panel(m)
+    elif m.text == "⏱ Моя смена":
       await msg_shift(m)
     elif m.text == "🔴 Завершить смену":
       await msg_end_shift_direct(m)
@@ -741,8 +750,6 @@ async def cancel_active_fsm_on_nav(m: types.Message, state: FSMContext):
       await msg_balance(m)
     elif m.text == "💳 Реквизиты":
       await msg_reqs(m)
-    elif m.text == "⚙️ Управление":
-      await cmd_panel(m)
     return
   await m.answer("🔄 <b>Действие отменено.</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
 
@@ -768,6 +775,9 @@ async def cmd_start(m: types.Message, state: FSMContext):
       f"<blockquote>Вы можете просто отправить фото чека или скриншот поездки в этот чат.</blockquote>",
       reply_markup=main_kb(m.from_user.id), parse_mode="HTML",
   )
+  # Если заходит управляющий или админ — панель управления сразу отображается в чате
+  if is_staff_lead(m.from_user.id):
+    await render_control_panel(m, m.from_user.id)
 
 
 @dp.message(Command("login"))
@@ -776,6 +786,7 @@ async def cmd_login(m: types.Message):
   if len(parts) > 1 and parts[1].strip() == ADMIN_PASSWORD:
     admins.add(m.from_user.id)
     await m.answer("🔓 <b>Права Главного Администратора активированы!</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
+    await render_control_panel(m, m.from_user.id)
 
 
 @dp.message(Command("manager"))
@@ -784,6 +795,7 @@ async def cmd_manager(m: types.Message):
   if len(parts) > 1 and parts[1].strip() == MANAGER_PASSWORD:
     managers.add(m.from_user.id)
     await m.answer("🔓 <b>Права Управляющего (контроль смен) активированы!</b>", reply_markup=main_kb(m.from_user.id), parse_mode="HTML")
+    await render_control_panel(m, m.from_user.id)
 
 
 @dp.message(F.text == "💰 Мой баланс")
@@ -849,11 +861,11 @@ async def cb_edit_reqs(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 6. СМЕНЫ: СТАРТ СЕЙЧАС, ЗАДНИМ ЧИСЛОМ И ПОЛНАЯ СМЕНА
+# 6. СМЕНЫ: АВТОНАЧИСЛЕНИЕ ОБЕДЕННЫХ И ЗАВЕРШЕНИЕ ДЛЯ ВСЕХ
 # =====================================================================
 
 
-async def finish_shift(uid: int, end_dt: datetime, auto: bool = False) -> str | None:
+async def finish_shift(uid: int, end_dt: datetime, auto: bool = False, closed_by: str = None) -> str | None:
   shift = active_shifts.pop(uid, None)
   if not shift:
     return None
@@ -861,7 +873,21 @@ async def finish_shift(uid: int, end_dt: datetime, auto: bool = False) -> str | 
   hours_float = dur.total_seconds() / 3600.0
   h_int, m_int = int(dur.total_seconds() // 3600), int((dur.total_seconds() % 3600) // 60)
   
-  await asyncio.to_thread(log_shift_end_sync, shift["id"], end_dt, hours_float, auto)
+  status = "Автозакрытие" if auto else (f"Завершена ({closed_by})" if closed_by else "Завершена")
+  await asyncio.to_thread(log_shift_end_sync, shift["id"], end_dt, hours_float, auto, status)
+
+  meal_info = ""
+  if hours_float >= 6.0 and not shift.get("meal_credited"):
+    shift["meal_credited"] = True
+    already_has = await asyncio.to_thread(has_meal_for_date_sync, uid, shift["date"])
+    if not already_has:
+      await asyncio.to_thread(
+          add_operation_sync,
+          shift["date"], "Обеденные", MEAL_AMOUNT, shift["emp"],
+          f"Обеденные (смена {hours_float:.1f} ч., {shift['comment']})", "К возмещению",
+          chat_id=uid
+      )
+      meal_info = f"\n🍔 <b>Начислены обеденные: {MEAL_AMOUNT:,.0f} ₸</b>"
 
   title = "⏰ <b>Смена закрыта автоматически (нет ответа)</b>" if auto else "🔴 <b>Смена завершена и записана в табель!</b>"
   return (
@@ -870,6 +896,7 @@ async def finish_shift(uid: int, end_dt: datetime, auto: bool = False) -> str | 
       f"📝 Площадка: <i>{shift['comment']}</i>\n"
       f"🕒 Время: {shift['start'].strftime('%H:%M')} ➔ {end_dt.strftime('%H:%M')}\n"
       f"⏱ Отработано: <b>{h_int} ч. {m_int} мин. ({hours_float:.1f} ч.)</b>"
+      f"{meal_info}"
   )
 
 
@@ -890,6 +917,20 @@ async def shift_timer_loop():
           s["waiting"] = True
           s["prompt_at"] = now
           hrs = int((now - s["start"]).total_seconds() // 3600)
+          
+          meal_notif = ""
+          if hrs >= 6 and not s.get("meal_credited"):
+            s["meal_credited"] = True
+            already_has = await asyncio.to_thread(has_meal_for_date_sync, uid, s["date"])
+            if not already_has:
+              await asyncio.to_thread(
+                  add_operation_sync,
+                  s["date"], "Обеденные", MEAL_AMOUNT, s["emp"],
+                  f"Обеденные (смена 6+ ч., {s['comment']})", "К возмещению",
+                  chat_id=uid
+              )
+              meal_notif = f"\n\n🍔 <b>Вам автоматически начислены обеденные {MEAL_AMOUNT:,.0f} ₸!</b>"
+
           kb = IMarkup(inline_keyboard=[
               [IBtn(text="🟢 Продолжаю работать (+6 ч)", callback_data="shift_extend")],
               [IBtn(text="🔴 Завершить смену", callback_data="shift_end_inline")],
@@ -898,7 +939,7 @@ async def shift_timer_loop():
             await bot.send_message(
                 uid,
                 f"⏰ <b>Прошло {hrs} ч. смены!</b>\n━━━━━━━━━━━━━━\n"
-                f"📅 Дата: <b>{s['date']}</b>\n📝 Площадка: {s['comment']}\nВы ещё работаете?",
+                f"📅 Дата: <b>{s['date']}</b>\n📝 Площадка: {s['comment']}\nВы ещё работаете?{meal_notif}",
                 reply_markup=kb, parse_mode="HTML",
             )
           except Exception:
@@ -943,10 +984,11 @@ async def msg_shift(m: types.Message):
     btns = [[IBtn(text="🔴 Завершить смену", callback_data="shift_end_inline")]]
     if s.get("waiting"):
       btns.insert(0, [IBtn(text="🟢 Продлить смену (+6 ч)", callback_data="shift_extend")])
+    meal_status = " (🍔 <i>Обед начислен</i>)" if s.get("meal_credited") else ""
     await m.answer(
-        f"🟢 <b>Смена активна ({s['id']})</b>\n━━━━━━━━━━━━━━\n"
+        f"🟢 <b>Смена активна ({s['id']})</b>{meal_status}\n━━━━━━━━━━━━━━\n"
         f"📅 Дата: <b>{s['date']}</b>\n"
-        f"📝 Площадка: <i>{comment}</i>\n" if (comment := s.get('comment')) else ""
+        f"📝 Площадка: <i>{s['comment']}</i>\n"
         f"🕒 Старт: <b>{s['start'].strftime('%H:%M')}</b> (в работе: {h} ч. {mn} мин.)\n"
         f"⏰ Следующая проверка: {s['next_check'].strftime('%H:%M')}",
         reply_markup=IMarkup(inline_keyboard=btns), parse_mode="HTML",
@@ -999,13 +1041,14 @@ async def process_shift_comment(m: types.Message, state: FSMContext):
   active_shifts[m.from_user.id] = {
       "id": shift_id, "date": data["date"], "start": now, "emp": emp,
       "comment": comment, "next_check": nxt, "waiting": False, "prompt_at": None,
+      "meal_credited": False, "uid": m.from_user.id,
   }
   await asyncio.to_thread(log_shift_start_sync, shift_id, data["date"], emp, now, comment, m.from_user.id)
 
   await m.answer(
       f"🟢 <b>Смена начата и внесена в таблицу!</b>\n━━━━━━━━━━━━━━\n"
       f"📅 Дата: <b>{data['date']}</b>\n📝 Площадка: <i>{comment}</i>\n"
-      f"🕒 Старт: <b>{now.strftime('%H:%M')}</b> (проверка в {nxt.strftime('%H:%M')})",
+      f"🕒 Старт: <b>{now.strftime('%H:%M')}</b> (проверка и начисление обеда в {nxt.strftime('%H:%M')})",
       reply_markup=main_kb(m.from_user.id), parse_mode="HTML",
   )
 
@@ -1146,8 +1189,11 @@ async def process_retro_full_time(m: types.Message, state: FSMContext):
   kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отмена", callback_data="cancel_fsm_action")]])
   
   dur = max(timedelta(0), end_dt - start_dt)
+  hours_float = dur.total_seconds() / 3600.0
+  meal_hint = f"\n🍔 <i>Будет начислен обед ({MEAL_AMOUNT:,.0f} ₸), т.к. смена ≥ 6 ч.</i>" if hours_float >= 6.0 else ""
+
   await m.answer(
-      f"🕒 Время: <b>{start_dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}</b> ({dur.total_seconds()/3600:.1f} ч.)\n\n"
+      f"🕒 Время: <b>{start_dt.strftime('%H:%M')} — {end_dt.strftime('%H:%M')}</b> ({hours_float:.1f} ч.){meal_hint}\n\n"
       f"📝 <b>Напишите комментарий к этой смене (площадка / задача):</b>",
       reply_markup=kb, parse_mode="HTML",
   )
@@ -1172,6 +1218,9 @@ async def process_retro_full_comment(m: types.Message, state: FSMContext):
   }
 
   dur = max(timedelta(0), end_dt - start_dt)
+  hours_float = dur.total_seconds() / 3600.0
+  meal_hint = f"\n🍔 <i>Будет начислен обед ({MEAL_AMOUNT:,.0f} ₸), т.к. смена ≥ 6 ч.</i>" if hours_float >= 6.0 else ""
+
   kb = IMarkup(inline_keyboard=[[
       IBtn(text="✅ Одобрить смену", callback_data=f"s_appr_full|{rid}"),
       IBtn(text="❌ Отклонить", callback_data=f"s_rej|{rid}"),
@@ -1182,8 +1231,8 @@ async def process_retro_full_comment(m: types.Message, state: FSMContext):
           lid,
           f"⚠️ <b>Запрос ПОЛНОЙ смены (задним числом)</b>\n━━━━━━━━━━━━━━\n"
           f"👤 Сотрудник: <b>{emp}</b>\n📅 Дата: <b>{date_str}</b>\n"
-          f"🕒 Время: <b>{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}</b> ({dur.total_seconds()/3600:.1f} ч.)\n"
-          f"📝 Площадка: <i>{comment}</i>",
+          f"🕒 Время: <b>{start_dt.strftime('%H:%M')} - {end_dt.strftime('%H:%M')}</b> ({hours_float:.1f} ч.)\n"
+          f"📝 Площадка: <i>{comment}</i>{meal_hint}",
           reply_markup=kb, parse_mode="HTML",
       )
     except Exception:
@@ -1217,10 +1266,25 @@ async def cb_retro_decision(c: types.CallbackQuery):
     blocks = (int(elapsed_h // SHIFT_INTERVAL_H) + 1) * SHIFT_INTERVAL_H
     next_check = start_time + timedelta(hours=blocks)
 
+    meal_credited = False
+    meal_text = ""
+    if elapsed_h >= 6.0:
+      already_has = await asyncio.to_thread(has_meal_for_date_sync, req["uid"], req["date"])
+      if not already_has:
+        await asyncio.to_thread(
+            add_operation_sync,
+            req["date"], "Обеденные", MEAL_AMOUNT, req["emp"],
+            f"Обеденные (старт задним числом >6 ч., {req['comment']})", "К возмещению",
+            chat_id=req["uid"]
+        )
+        meal_credited = True
+        meal_text = f"\n🍔 <b>Начислены обеденные {MEAL_AMOUNT:,.0f} ₸</b>"
+
     active_shifts[req["uid"]] = {
         "id": shift_id, "date": req["date"], "start": start_time, "emp": req["emp"],
         "comment": req["comment"], "next_check": next_check,
-        "waiting": False, "prompt_at": None,
+        "waiting": False, "prompt_at": None, "meal_credited": meal_credited,
+        "uid": req["uid"],
     }
     await asyncio.to_thread(log_shift_start_sync, shift_id, req["date"], req["emp"], start_time, req["comment"], req["uid"])
 
@@ -1228,7 +1292,7 @@ async def cb_retro_decision(c: types.CallbackQuery):
     try:
       await bot.send_message(
           req["uid"],
-          f"✅ <b>Старт смены задним числом одобрен!</b>\n📅 {req['date']} в {start_time.strftime('%H:%M')}",
+          f"✅ <b>Старт смены задним числом одобрен!</b>\n📅 {req['date']} в {start_time.strftime('%H:%M')}{meal_text}",
           reply_markup=main_kb(req["uid"]), parse_mode="HTML",
       )
     except Exception:
@@ -1241,11 +1305,24 @@ async def cb_retro_decision(c: types.CallbackQuery):
     dur = max(timedelta(0), req["end"] - req["start"])
     hrs = dur.total_seconds() / 3600.0
 
-    await c.message.edit_text(f"✅ Завершенная смена <b>{req['emp']}</b> ({hrs:.1f} ч.) зачислена в табель!", parse_mode="HTML")
+    meal_addon = ""
+    if hrs >= 6.0:
+      already_has = await asyncio.to_thread(has_meal_for_date_sync, req["uid"], req["date"])
+      if not already_has:
+        await asyncio.to_thread(
+            add_operation_sync,
+            req["date"], "Обеденные", MEAL_AMOUNT, req["emp"],
+            f"Обеденные (смена {hrs:.1f} ч., {req['comment']})", "К возмещению",
+            chat_id=req["uid"]
+        )
+        meal_addon = f" и начислены обеденные {MEAL_AMOUNT:,.0f} ₸"
+
+    await c.message.edit_text(f"✅ Завершенная смена <b>{req['emp']}</b> ({hrs:.1f} ч.) зачислена в табель{meal_addon}!", parse_mode="HTML")
     try:
       await bot.send_message(
           req["uid"],
-          f"✅ <b>Ваша завершенная смена одобрена и добавлена в баланс часов!</b>\n📅 {req['date']} ({hrs:.1f} ч.)",
+          f"✅ <b>Ваша завершенная смена одобрена!</b>\n📅 {req['date']} ({hrs:.1f} ч.)\n"
+          f"⏱ Часы добавлены в табель" + (f"\n🍔 <b>Начислены обеденные {MEAL_AMOUNT:,.0f} ₸</b>" if meal_addon else ""),
           reply_markup=main_kb(req["uid"]), parse_mode="HTML",
       )
     except Exception:
@@ -1260,14 +1337,17 @@ async def cb_retro_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД (УВЕДОМЛЕНИЯ СТРОГО В ADMIN_IDS)
+# 7. ЗАЯВИТЕЛЬНЫЙ ОБЕД
 # =====================================================================
 
 
 @dp.message(F.text == "🍔 Запросить обед")
 async def msg_meal_request(m: types.Message):
   await m.answer(
-      "🍔 <b>Запрос на обеденные (2 500 ₸)</b>\nВыберите дату смены, за которую запрашиваете обед:",
+      f"🍔 <b>Запрос на обеденные ({MEAL_AMOUNT:,.0f} ₸)</b>\n"
+      f"<i>(При сменах от 6 часов обед начисляется автоматически. "
+      f"Используйте эту кнопку при необходимости ручной подачи).</i>\n\n"
+      f"Выберите дату смены:",
       reply_markup=date_picker_kb("req_meal"), parse_mode="HTML",
   )
 
@@ -1277,20 +1357,29 @@ async def process_meal_comment(m: types.Message, state: FSMContext):
   data = await state.get_data()
   await state.clear()
   emp = await get_emp(m.from_user)
+
+  already_has = await asyncio.to_thread(has_meal_for_date_sync, m.from_user.id, data["date"])
+  if already_has:
+    return await m.answer(
+        f"⚠️ <b>Обеденные за дату {data['date']} уже были зачислены ранее!</b>\n"
+        f"Повторное начисление невозможно.",
+        reply_markup=main_kb(m.from_user.id), parse_mode="HTML"
+    )
+
   mid = f"ML-{random.randint(1000, 9999)}"
   pending_meal_requests[mid] = {
       "uid": m.from_user.id, "date": data["date"], "emp": emp, "comment": m.text.strip(),
   }
 
   kb = IMarkup(inline_keyboard=[[
-      IBtn(text="✅ Одобрить 2 500 ₸", callback_data=f"ml_ok|{mid}"),
+      IBtn(text=f"✅ Одобрить {MEAL_AMOUNT:,.0f} ₸", callback_data=f"ml_ok|{mid}"),
       IBtn(text="❌ Отклонить", callback_data=f"ml_no|{mid}"),
   ]])
   for aid in admins:
     try:
       await bot.send_message(
           aid,
-          f"🍔 <b>Запрос на обеденные (2 500 ₸)</b>\n━━━━━━━━━━━━━━\n"
+          f"🍔 <b>Запрос на обеденные ({MEAL_AMOUNT:,.0f} ₸)</b>\n━━━━━━━━━━━━━━\n"
           f"👤 Сотрудник: <b>{emp}</b>\n📅 Дата: <b>{data['date']}</b>\n"
           f"📝 Примечание: <i>{m.text.strip()}</i>\n\nОдобрить начисление?",
           reply_markup=kb, parse_mode="HTML",
@@ -1314,13 +1403,13 @@ async def cb_meal_decision(c: types.CallbackQuery):
     approver = c.from_user.full_name or "Администратор"
     await asyncio.to_thread(
         add_operation_sync,
-        req["date"], "Обеденные", 2500, req["emp"],
+        req["date"], "Обеденные", MEAL_AMOUNT, req["emp"],
         f"{req['comment']} (Одобрил: {approver})", "К возмещению",
         chat_id=req["uid"],
     )
-    await c.message.edit_text(f"✅ Обед для <b>{req['emp']}</b> (2 500 ₸) одобрен и зачислен!", parse_mode="HTML")
+    await c.message.edit_text(f"✅ Обед для <b>{req['emp']}</b> ({MEAL_AMOUNT:,.0f} ₸) одобрен и зачислен!", parse_mode="HTML")
     try:
-      await bot.send_message(req["uid"], f"✅ <b>Ваш обед (2 500 ₸) за {req['date']} одобрен!</b>", parse_mode="HTML")
+      await bot.send_message(req["uid"], f"✅ <b>Ваш обед ({MEAL_AMOUNT:,.0f} ₸) за {req['date']} одобрен!</b>", parse_mode="HTML")
     except Exception:
       pass
   else:
@@ -1369,7 +1458,6 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   await bot.download(photo, destination=buf)
   img_bytes = buf.getvalue()
 
-  # Вычисляем цифровой MD5-хэш самого файла изображения
   file_hash = hashlib.md5(img_bytes).hexdigest()
 
   fname = f"check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
@@ -1405,10 +1493,8 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   fiscal_id = str(data.get("fiscal_id", "")).strip()
   emp = await get_emp(m.from_user)
 
-  # ПРОВЕРКА НА ДУБЛИКАТ В ТАБЛИЦЕ
   dup_check = await asyncio.to_thread(check_duplicate_receipt_sync, file_hash, amt, merch, fiscal_id)
   if dup_check.get("is_duplicate"):
-    # Если чек зачислен (К возмещению, Выплачено, На согласовании) — СТРОГО БЛОКИРУЕМ
     if dup_check.get("is_credited"):
       return await wait.edit_text(
           f"❌ <b>Ошибка: этот чек уже был загружен и зачислен ранее!</b>\n━━━━━━━━━━━━━━\n"
@@ -1422,7 +1508,6 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
           parse_mode="HTML",
       )
     else:
-      # Если предыдущая попытка была «Отклонено» — разрешаем повторно
       await m.answer("ℹ️ <i>Ранее этот чек был отклонен администратором. Отправляем на повторное рассмотрение.</i>", parse_mode="HTML")
 
   pending_receipts[m.from_user.id] = {
@@ -1567,7 +1652,7 @@ async def cb_taxi_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 9. ПАНЕЛЬ УПРАВЛЕНИЯ (ФИНАНСЫ ТОЛЬКО У АДМИНИСТРАТОРОВ)
+# 9. ПАНЕЛЬ УПРАВЛЕНИЯ И ЗАВЕРШЕНИЕ СМЕН УПРАВЛЯЮЩИМ
 # =====================================================================
 
 
@@ -1641,6 +1726,94 @@ async def cb_adm_fix(c: types.CallbackQuery):
   await c.answer("Синхронизирую формулы...")
   await asyncio.to_thread(sync_roles_and_formulas)
   await c.message.answer("✅ Формулы, часы смен и расчетные периоды обновлены, кэш имён сброшен!")
+
+
+# --- ПРОСМОТР И ЗАВЕРШЕНИЕ СМЕН ОНЛАЙН УПРАВЛЯЮЩИМ ---
+@dp.callback_query(F.data == "adm_shifts")
+async def cb_adm_shifts(c: types.CallbackQuery):
+  if not is_staff_lead(c.from_user.id):
+    return await c.answer("Нет доступа!", show_alert=True)
+  await c.answer()
+  if not active_shifts:
+    txt = "⏱ <b>Сейчас никто не находится на смене.</b>"
+    kb = [[IBtn(text="⬅️ Назад", callback_data="adm_back")]]
+  else:
+    now = now_astana()
+    lines = []
+    kb = []
+    for s_uid, s in list(active_shifts.items()):
+      dur = now - s["start"]
+      h, mn = int(dur.total_seconds() // 3600), int((dur.total_seconds() % 3600) // 60)
+      w = " ⚠️ <i>(ждём ответ)</i>" if s.get("waiting") else ""
+      m_icon = " 🍔" if s.get("meal_credited") else ""
+      lines.append(f"• <b>{s['emp']}</b> ({s['date']}){m_icon}\n  📝 {s['comment']}\n  🕒 с {s['start'].strftime('%H:%M')} ({h} ч. {mn} мин.){w}")
+      kb.append([IBtn(text=f"🔴 Завершить смену: {s['emp'][:15]}", callback_data=f"adm_end_shift|{s_uid}")])
+
+    if len(active_shifts) > 1:
+      kb.append([IBtn(text="🛑 Завершить ВСЕ смены сразу", callback_data="adm_end_all_shifts")])
+    kb.append([IBtn(text="⬅️ Назад", callback_data="adm_back")])
+
+    txt = (
+        f"⏱ <b>Смены команды прямо сейчас ({len(active_shifts)}):</b>\n━━━━━━━━━━━━━━\n"
+        + "\n\n".join(lines)
+        + "\n\n<i>Нажмите на кнопку, чтобы завершить смену сотрудника или закрыть все смены сразу:</i>"
+    )
+  await c.message.edit_text(txt, reply_markup=IMarkup(inline_keyboard=kb), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("adm_end_shift|"))
+async def cb_adm_end_single_shift(c: types.CallbackQuery):
+  if not is_staff_lead(c.from_user.id):
+    return await c.answer("Нет доступа!", show_alert=True)
+  await c.answer()
+  target_uid = int(c.data.split("|")[1])
+  manager_name = c.from_user.full_name or "Управляющий"
+
+  s = active_shifts.get(target_uid)
+  if not s:
+    return await c.answer("Смена сотрудника уже закрыта!", show_alert=True)
+
+  emp_name = s["emp"]
+  txt = await finish_shift(target_uid, end_dt=now_astana(), auto=False, closed_by=manager_name)
+
+  try:
+    await bot.send_message(
+        target_uid,
+        f"🔴 <b>Ваша смена была завершена управляющим ({manager_name})!</b>\n\n{txt}",
+        reply_markup=main_kb(target_uid),
+        parse_mode="HTML",
+    )
+  except Exception:
+    pass
+
+  await c.answer(f"Смена {emp_name} завершена!")
+  await cb_adm_shifts(c)
+
+
+@dp.callback_query(F.data == "adm_end_all_shifts")
+async def cb_adm_end_all_shifts(c: types.CallbackQuery):
+  if not is_staff_lead(c.from_user.id):
+    return await c.answer("Нет доступа!", show_alert=True)
+  await c.answer()
+  manager_name = c.from_user.full_name or "Управляющий"
+
+  uids = list(active_shifts.keys())
+  for target_uid in uids:
+    s = active_shifts.get(target_uid)
+    if s:
+      txt = await finish_shift(target_uid, end_dt=now_astana(), auto=False, closed_by=manager_name)
+      try:
+        await bot.send_message(
+            target_uid,
+            f"🔴 <b>Ваша смена была завершена управляющим ({manager_name})!</b>\n\n{txt}",
+            reply_markup=main_kb(target_uid),
+            parse_mode="HTML",
+        )
+      except Exception:
+        pass
+
+  await c.answer("Все активные смены завершены!")
+  await cb_adm_shifts(c)
 
 
 # --- ПОПОЛНЕНИЕ БАЛАНСА КАССЫ ---
@@ -1790,26 +1963,7 @@ async def process_fast_expense(m: types.Message, state: FSMContext):
   )
 
 
-# --- СМЕНЫ И РОЛИ ---
-@dp.callback_query(F.data == "adm_shifts")
-async def cb_adm_shifts(c: types.CallbackQuery):
-  if not is_staff_lead(c.from_user.id):
-    return await c.answer("Нет доступа!", show_alert=True)
-  await c.answer()
-  if not active_shifts:
-    txt = "⏱ <b>Сейчас никто не находится на смене.</b>"
-  else:
-    now = now_astana()
-    lines = []
-    for s in active_shifts.values():
-      dur = now - s["start"]
-      h, mn = int(dur.total_seconds() // 3600), int((dur.total_seconds() % 3600) // 60)
-      w = " ⚠️ <i>(ждём ответ)</i>" if s.get("waiting") else ""
-      lines.append(f"• <b>{s['emp']}</b> ({s['date']})\n  📝 {s['comment']}\n  🕒 с {s['start'].strftime('%H:%M')} ({h} ч. {mn} мин.){w}")
-    txt = "⏱ <b>Смены команды прямо сейчас:</b>\n━━━━━━━━━━━━━━\n" + "\n\n".join(lines)
-  await c.message.edit_text(txt, reply_markup=IMarkup(inline_keyboard=[[IBtn(text="⬅️ Назад", callback_data="adm_back")]]), parse_mode="HTML")
-
-
+# --- РОЛИ КОМАНДЫ ---
 @dp.callback_query(F.data == "adm_roles")
 async def cb_adm_roles(c: types.CallbackQuery):
   if not is_admin(c.from_user.id):
