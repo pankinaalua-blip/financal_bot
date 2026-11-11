@@ -179,7 +179,7 @@ async def ask_gemini_direct_rest(img_bytes: bytes, prompt: str) -> dict | None:
 async def ask_gemini(contents, raw_bytes: bytes = None, prompt_str: str = "") -> dict | None:
   global last_gemini_error
   last_gemini_error = ""
-  models = ["gemini-2.0-flash", "gemini-1.5-flash"]
+  models = ["gemini-3.8-flash", "gemini-3.6-flash"]
   cfg = genai_types.GenerateContentConfig(
       response_mime_type="application/json",
       temperature=0.1,
