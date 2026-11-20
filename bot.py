@@ -62,9 +62,7 @@ MEAL_AMOUNT = 2500.0
 
 # Принудительный IPv4 и закрытие зависших сокетов для стабильной работы на Render
 tg_session = AiohttpSession(timeout=90.0)
-if hasattr(tg_session, "_connector_init") and isinstance(
-    tg_session._connector_init, dict
-):
+if hasattr(tg_session, "_connector_init") and isinstance(tg_session._connector_init, dict):
   tg_session._connector_init["family"] = socket.AF_INET
   tg_session._connector_init["force_close"] = True
 
@@ -121,6 +119,16 @@ class Form(StatesGroup):
 
 def now_astana() -> datetime:
   return datetime.now(TZ_ASTANA)
+
+
+def is_night_ride(receipt_time: str) -> bool:
+  """Определяет ночной тариф (22:00–06:59) строго по времени поездки со скриншота."""
+  match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", str(receipt_time or ""))
+  if match:
+    h = int(match.group(1))
+    return h >= 22 or h < 7
+  now = now_astana()
+  return now.hour >= 22 or now.hour < 7
 
 
 def get_pay_period(dt: datetime | date) -> str:
@@ -209,7 +217,7 @@ async def ask_gemini(contents, raw_bytes: bytes = None, prompt_str: str = "") ->
   models = ["gemini-3.8-flash", "gemini-3.6-flash"]
   cfg = genai_types.GenerateContentConfig(
       response_mime_type="application/json",
-      temperature=0.1,
+      temperature=0.1
   )
   for m in models:
     try:
@@ -1459,13 +1467,11 @@ async def cb_meal_decision(c: types.CallbackQuery):
 
 @dp.message(F.text == "🚕 Такси")
 async def msg_taxi_prompt(m: types.Message):
-  now = now_astana()
-  night = now.hour >= 22 or now.hour < 7
-  mode_txt = "🌙 Ночной тариф (22:00–07:00) — начисление сразу!" if night else "☀️ Дневной тариф — через согласование с Администратором."
   await m.answer(
-      f"🚕 <b>Учет поездок на такси</b>\n━━━━━━━━━━━━━━\n"
-      f"Отправьте скриншот поездки из истории заказов (где видны <b>дата, время и сумма</b>).\n"
-      f"<blockquote>{mode_txt}</blockquote>",
+      "🚕 <b>Учет поездок на такси</b>\n━━━━━━━━━━━━━━\n"
+      "Отправьте скриншот поездки из истории заказов (где видны <b>дата, время и сумма</b>).\n"
+      "<blockquote>🌙 Ночной тариф (22:00–06:59) — автоодобрение.\n"
+      "☀️ Дневной тариф (07:00–21:59) — через согласование с Администратором.</blockquote>",
       parse_mode="HTML",
   )
 
@@ -1576,18 +1582,25 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   fname = f"check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
 
+  # Определяем ночной / дневной тариф строго по времени поездки со скриншота!
+  night_taxi = is_night_ride(receipt_time) if is_taxi else False
+
   pending_receipts[m.from_user.id] = {
       "amount": amt, "merchant": merch, "category": "Такси" if is_taxi else cat,
       "desc": desc, "emp": emp, "link": drive_url,
       "fid": photo.file_unique_id, "file_id": photo.file_id,
       "file_hash": file_hash, "receipt_date": receipt_date,
       "receipt_time": receipt_time, "fiscal_id": fiscal_id,
+      "is_night": night_taxi,
   }
 
-  now = now_astana()
   badge = ""
   if is_taxi:
-    badge = "\n🌙 <i>Ночное такси (автоодобрение)</i>" if (now.hour >= 22 or now.hour < 7) else "\n☀️ <i>Дневное такси (на согласование)</i>"
+    badge = (
+        f"\n🌙 <i>Ночное такси ({receipt_time} — автоодобрение)</i>"
+        if night_taxi
+        else f"\n☀️ <i>Дневное такси ({receipt_time} — на согласование)</i>"
+    )
 
   dt_line = ""
   if receipt_date or receipt_time:
@@ -1642,8 +1655,8 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     if not rec:
       return await c.message.edit_text("⚠️ Данные чека устарели.")
 
-    now = now_astana()
     is_taxi = rec["category"] == "Такси"
+    is_night = rec.get("is_night", is_night_ride(rec.get("receipt_time", "")))
 
     meta_parts = []
     dt_str = f"{rec.get('receipt_date', '')} {rec.get('receipt_time', '')}".strip()
@@ -1654,9 +1667,10 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     meta_suffix = f" [{', '.join(meta_parts)}]" if meta_parts else ""
 
     drive_html = f'\n📎 <a href="{rec["link"]}">Открыть оригинал на Диске</a>' if rec.get("link") else ""
-    dt_card_line = f"\n🕒 Чек от: <code>{dt_str}</code>" if dt_str else ""
+    dt_card_line = f"\n🕒 Время поездки: <code>{dt_str}</code>" if dt_str else ""
 
-    if is_taxi and not (now.hour >= 22 or now.hour < 7):
+    # Если такси дневное (07:00–21:59 по времени со скриншота) — строго на согласование
+    if is_taxi and not is_night:
       tx_id = f"TX-{random.randint(10000, 99999)}"
       full_comment = f"{rec['merchant']}: {rec['desc']} (Дневное такси){meta_suffix}"
       await asyncio.to_thread(
@@ -1683,8 +1697,11 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
             await bot.send_message(aid, caption, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
           print(f"Send taxi approval photo error: {e}")
+      ride_time_note = f" ({rec['receipt_time']})" if rec.get("receipt_time") else ""
       return await c.message.edit_text(
-          f"⏳ <b>Дневное такси отправлено Администратору на согласование!</b>\n📅 {label} — <b>{rec['amount']:,.0f} ₸</b>", parse_mode="HTML",
+          f"⏳ <b>Дневное такси{ride_time_note} отправлено Администратору на согласование!</b>\n"
+          f"📅 {label} — <b>{rec['amount']:,.0f} ₸</b>",
+          parse_mode="HTML",
       )
 
     tx_id = f"TX-{random.randint(10000, 99999)}"
