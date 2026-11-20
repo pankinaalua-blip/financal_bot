@@ -295,13 +295,22 @@ def has_meal_for_date_sync(chat_id: int | str, date_str: str) -> bool:
   return False
 
 
-def check_duplicate_receipt_sync(file_hash: str, amount: float, merchant: str, fiscal_id: str = "") -> dict:
+def check_duplicate_receipt_sync(
+    file_hash: str, amount: float, merchant: str,
+    fiscal_id: str = "", receipt_date: str = "", receipt_time: str = "",
+) -> dict:
+  """
+  Проверяет наличие точного дубликата чека в листе «Операции».
+  Не блокирует поездки/чеки с одинаковой суммой, если дата или время чека отличаются.
+  """
   try:
     ws = spreadsheet.worksheet("Операции")
     rows = ws.get_all_values()[1:]
     amount = float(amount)
     merchant_clean = str(merchant).strip().lower()
     fiscal_clean = str(fiscal_id).strip().lower() if fiscal_id else ""
+    r_date = str(receipt_date).strip().lower()
+    r_time = str(receipt_time).strip().lower()
 
     for r in rows:
       if len(r) < 9:
@@ -316,13 +325,20 @@ def check_duplicate_receipt_sync(file_hash: str, amount: float, merchant: str, f
       row_hash = r[11].strip() if len(r) > 11 else ""
 
       matched = False
+
+      # 1. Точное совпадение по цифровому MD5-хэшу самого файла
       if file_hash and row_hash and file_hash == row_hash:
         matched = True
-      elif fiscal_clean and len(fiscal_clean) >= 4 and fiscal_clean in comment:
+
+      # 2. Точное совпадение по фискальному признаку / номеру чека / номеру заказа
+      elif fiscal_clean and len(fiscal_clean) >= 5 and fiscal_clean in comment:
         matched = True
-      elif abs(row_amt - amount) < 0.01 and merchant_clean:
-        if merchant_clean in comment or (merchant_clean in ["яндекс go", "такси"] and "такси" in comment):
-          matched = True
+
+      # 3. Совпадение по сумме + поставщику + ДАТЕ И ВРЕМЕНИ на самом чеке
+      elif abs(row_amt - amount) < 0.01 and r_date and r_time:
+        if r_date in comment and r_time in comment:
+          if merchant_clean and (merchant_clean in comment or (merchant_clean in ["яндекс go", "такси"] and "такси" in comment)):
+            matched = True
 
       if matched:
         return {
@@ -656,7 +672,6 @@ def get_debts_sync(filter_emp: str = None, filter_uid: int | str = None):
 def main_kb(uid: int) -> RMarkup:
   shift_btn = KBtn(text="🔴 Завершить смену") if uid in active_shifts else KBtn(text="⏱ Моя смена")
   kb = []
-  # Для управляющего и админа кнопка «⚙️ Управление» ВСЕГДА стоит на первой строке
   if is_staff_lead(uid):
     kb.append([KBtn(text="⚙️ Управление")])
   kb.extend([
@@ -775,7 +790,6 @@ async def cmd_start(m: types.Message, state: FSMContext):
       f"<blockquote>Вы можете просто отправить фото чека или скриншот поездки в этот чат.</blockquote>",
       reply_markup=main_kb(m.from_user.id), parse_mode="HTML",
   )
-  # Если заходит управляющий или админ — панель управления сразу отображается в чате
   if is_staff_lead(m.from_user.id):
     await render_control_panel(m, m.from_user.id)
 
@@ -1421,7 +1435,7 @@ async def cb_meal_decision(c: types.CallbackQuery):
 
 
 # =====================================================================
-# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ, OCR И ПРОВЕРКА ДУБЛИКАТОВ
+# 8. ТАКСИ, ЧЕКИ СОТРУДНИКОВ, OCR И ОТОБРАЖЕНИЕ ФОТО ПРИ СОГЛАСОВАНИИ
 # =====================================================================
 
 
@@ -1469,11 +1483,14 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   )
 
   prompt = (
-      "Распознай данные кассового чека или поездки такси на фото. "
-      "Найди итоговую сумму (ИТОГ / ВСЕГО / СУММА), продавца, а также фискальный признак (ФП / ФД / номер чека или номер заказа такси, если виден). "
+      "Распознай данные кассового чека или скриншота поездки такси на фото. "
+      "Найди итоговую сумму (ИТОГ / ВСЕГО / СУММА), продавца, краткое описание (позиции или маршрут), "
+      "а также дату и время на самом чеке/скриншоте и фискальный номер/номер заказа. "
       "Верни ТОЛЬКО валидный JSON без лишнего текста: "
       '{"amount": число_суммы_без_пробелов, "merchant": "название продавца или Яндекс Go", '
-      '"category": "Такси" или "Прочие расходы", "description": "кратко суть (2-4 слова)", '
+      '"category": "Такси" или "Прочие расходы", "description": "кратко позиции или маршрут (2-6 слов)", '
+      '"receipt_date": "дата на чеке в формате ДД.ММ.ГГГГ или пустая строка", '
+      '"receipt_time": "время на чеке в формате ЧЧ:ММ или пустая строка", '
       '"fiscal_id": "номер чека, ФП или номер заказа такси, если есть, иначе пустая строка"}'
   )
 
@@ -1490,10 +1507,15 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   merch = str(data.get("merchant", "Чек")).strip()
   cat = str(data.get("category", "Прочие расходы")).strip()
   desc = str(data.get("description", "")).strip()
+  receipt_date = str(data.get("receipt_date", "")).strip()
+  receipt_time = str(data.get("receipt_time", "")).strip()
   fiscal_id = str(data.get("fiscal_id", "")).strip()
   emp = await get_emp(m.from_user)
 
-  dup_check = await asyncio.to_thread(check_duplicate_receipt_sync, file_hash, amt, merch, fiscal_id)
+  # ПРОВЕРКА НА ДУБЛИКАТ (с учётом даты и времени конкретного чека)
+  dup_check = await asyncio.to_thread(
+      check_duplicate_receipt_sync, file_hash, amt, merch, fiscal_id, receipt_date, receipt_time
+  )
   if dup_check.get("is_duplicate"):
     if dup_check.get("is_credited"):
       return await wait.edit_text(
@@ -1513,7 +1535,9 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   pending_receipts[m.from_user.id] = {
       "amount": amt, "merchant": merch, "category": cat,
       "desc": desc, "emp": emp, "link": drive_url,
-      "fid": photo.file_unique_id, "file_hash": file_hash,
+      "fid": photo.file_unique_id, "file_id": photo.file_id,
+      "file_hash": file_hash, "receipt_date": receipt_date,
+      "receipt_time": receipt_time, "fiscal_id": fiscal_id,
   }
 
   now = now_astana()
@@ -1523,11 +1547,15 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
     pending_receipts[m.from_user.id]["category"] = "Такси"
     badge = "\n🌙 <i>Ночное такси (автоодобрение)</i>" if (now.hour >= 22 or now.hour < 7) else "\n☀️ <i>Дневное такси (на согласование)</i>"
 
+  dt_line = ""
+  if receipt_date or receipt_time:
+    dt_line = f"\n🕒 Время на чеке: <code>{f'{receipt_date} {receipt_time}'.strip()}</code>"
+
   await wait.edit_text(
       f"🧾 <b>Распознан чек: {amt:,.0f} ₸</b>\n━━━━━━━━━━━━━━\n"
       f"📂 Категория: <b>{pending_receipts[m.from_user.id]['category']}</b>\n"
-      f"🏪 Поставщик: <i>{merch} ({desc})</i>{badge}\n\n"
-      f"📅 <b>Выберите дату расхода:</b>",
+      f"🏪 Поставщик: <i>{merch} ({desc})</i>{dt_line}{badge}\n\n"
+      f"📅 <b>Выберите дату расхода для таблицы:</b>",
       reply_markup=date_picker_kb("check"), parse_mode="HTML",
   )
 
@@ -1575,38 +1603,79 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     now = now_astana()
     is_taxi = rec["category"] == "Такси"
 
+    # Формируем подробное описание с метаданными чека (дата/время/номер)
+    meta_parts = []
+    dt_str = f"{rec.get('receipt_date', '')} {rec.get('receipt_time', '')}".strip()
+    if dt_str:
+      meta_parts.append(dt_str)
+    if rec.get("fiscal_id"):
+      meta_parts.append(f"Чек №{rec['fiscal_id']}")
+    meta_suffix = f" [{', '.join(meta_parts)}]" if meta_parts else ""
+
+    drive_html = f'\n📎 <a href="{rec["link"]}">Открыть оригинал на Диске</a>' if rec.get("link") else ""
+    dt_card_line = f"\n🕒 Чек от: <code>{dt_str}</code>" if dt_str else ""
+
     if is_taxi and not (now.hour >= 22 or now.hour < 7):
       tx_id = f"TX-{random.randint(10000, 99999)}"
+      full_comment = f"{rec['merchant']}: {rec['desc']} (Дневное такси){meta_suffix}"
       await asyncio.to_thread(
           add_operation_sync,
           label, "Такси", rec["amount"], rec["emp"],
-          f"{rec['merchant']}: {rec['desc']} (Дневное такси)",
-          "На согласовании", rec["link"], tx_id, uid, rec.get("file_hash", ""),
+          full_comment, "На согласовании", rec["link"], tx_id, uid, rec.get("file_hash", ""),
       )
       kb = IMarkup(inline_keyboard=[[
           IBtn(text="✅ Одобрить", callback_data=f"tx_ok|{tx_id}"),
           IBtn(text="❌ Отклонить", callback_data=f"tx_no|{tx_id}"),
       ]])
+      caption = (
+          f"🚕 <b>Дневное такси на согласовании</b> (<code>{tx_id}</code>)\n━━━━━━━━━━━━━━\n"
+          f"👤 Сотрудник: <b>{rec['emp']}</b>\n"
+          f"💵 Сумма: <b>{rec['amount']:,.0f} ₸</b>\n"
+          f"📝 Детали: <i>{rec['merchant']} — {rec['desc']}</i>\n"
+          f"📅 Дата в табель: <b>{label}</b>{dt_card_line}{drive_html}"
+      )
       for aid in admins:
         try:
-          await bot.send_message(
-              aid,
-              f"🚕 <b>Дневное такси на согласовании</b>\n━━━━━━━━━━━━━━\n"
-              f"👤 Сотрудник: <b>{rec['emp']}</b>\n💵 Сумма: <b>{rec['amount']:,.0f} ₸</b>\n📅 Дата: {label}",
-              reply_markup=kb, parse_mode="HTML",
-          )
-        except Exception:
-          pass
+          if rec.get("file_id"):
+            await bot.send_photo(aid, photo=rec["file_id"], caption=caption, reply_markup=kb, parse_mode="HTML")
+          else:
+            await bot.send_message(aid, caption, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+          print(f"Send taxi approval photo error: {e}")
       return await c.message.edit_text(
           f"⏳ <b>Дневное такси отправлено Администратору на согласование!</b>\n📅 {label} — <b>{rec['amount']:,.0f} ₸</b>", parse_mode="HTML",
       )
 
+    tx_id = f"TX-{random.randint(10000, 99999)}"
+    full_comment = f"{rec['merchant']}: {rec['desc']}{meta_suffix}"
     await asyncio.to_thread(
         add_operation_sync,
         label, rec["category"], rec["amount"], rec["emp"],
-        f"{rec['merchant']}: {rec['desc']}", "К возмещению", rec["link"],
-        None, uid, rec.get("file_hash", ""),
+        full_comment, "К возмещению", rec["link"],
+        tx_id, uid, rec.get("file_hash", ""),
     )
+
+    # Отправляем фото чека администратору для прозрачного контроля расходов
+    admin_caption = (
+        f"🧾 <b>Новый чек зачислен</b> (<code>{tx_id}</code>)\n━━━━━━━━━━━━━━\n"
+        f"👤 Сотрудник: <b>{rec['emp']}</b>\n"
+        f"📂 Категория: <b>{rec['category']}</b>\n"
+        f"💵 Сумма: <b>{rec['amount']:,.0f} ₸</b>\n"
+        f"📝 Позиции: <i>{rec['merchant']} — {rec['desc']}</i>\n"
+        f"📅 Дата в табель: <b>{label}</b>{dt_card_line}{drive_html}"
+    )
+    cancel_kb = IMarkup(inline_keyboard=[[IBtn(text="❌ Отклонить / аннулировать чек", callback_data=f"tx_no|{tx_id}")]])
+    for aid in admins:
+      if aid == uid:
+        continue
+      try:
+        if rec.get("file_id"):
+          await bot.send_photo(aid, photo=rec["file_id"], caption=admin_caption, reply_markup=cancel_kb, parse_mode="HTML")
+        else:
+          await bot.send_message(aid, admin_caption, reply_markup=cancel_kb, parse_mode="HTML")
+      except Exception as e:
+        print(f"Send receipt preview error: {e}")
+
     await c.message.edit_text(
         f"✅ <b>Расход внесен в таблицу!</b>\n━━━━━━━━━━━━━━\n"
         f"📂 Категория: <b>{rec['category']}</b>\n📅 Дата: <b>{label}</b>\n"
@@ -1648,7 +1717,16 @@ async def cb_taxi_decision(c: types.CallbackQuery):
 
   await asyncio.to_thread(upd)
   icon = "✅ Одобрено" if act == "tx_ok" else "❌ Отклонено"
-  await c.message.edit_text(f"{icon}: статус поездки изменен на <b>{new_st}</b>.", parse_mode="HTML")
+  approver = c.from_user.full_name or "Администратор"
+
+  # Сохраняем фото и прежнюю подпись, добавляя итоговый статус
+  base_text = c.message.caption or c.message.text or f"Операция {tx_id}"
+  updated_text = f"{base_text}\n\n━━━━━━━━━━━━━━\n{icon} ({approver}) — статус: <b>{new_st}</b>"
+
+  if c.message.photo:
+    await c.message.edit_caption(caption=updated_text, parse_mode="HTML")
+  else:
+    await c.message.edit_text(text=updated_text, parse_mode="HTML")
 
 
 # =====================================================================
