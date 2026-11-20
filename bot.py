@@ -8,11 +8,14 @@ import json
 import os
 import random
 import re
+import socket
 import urllib.parse
 import urllib.request
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F, types
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.exceptions import TelegramNetworkError
 from aiogram.filters import Command, CommandStart, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -57,7 +60,11 @@ SHIFT_INTERVAL_H = 6
 SHIFT_TIMEOUT_M = 30
 MEAL_AMOUNT = 2500.0
 
-bot = Bot(token=BOT_TOKEN)
+# Принудительный IPv4 и закрытие зависших сокетов для стабильной работы на Render
+tg_session = AiohttpSession(family=socket.AF_INET, force_close=True)
+tg_session.timeout = 90.0
+
+bot = Bot(token=BOT_TOKEN, session=tg_session)
 dp = Dispatcher(storage=MemoryStorage())
 
 ai_client = genai.Client(
@@ -140,6 +147,22 @@ def parse_kzt(val: str) -> float:
     return float(cleaned) if cleaned and cleaned not in ("-", ".", "-.") else 0.0
   except ValueError:
     return 0.0
+
+
+async def download_photo_bytes(photo: types.PhotoSize, retries: int = 3) -> bytes:
+  last_err = None
+  for attempt in range(1, retries + 1):
+    try:
+      buf = io.BytesIO()
+      file_info = await bot.get_file(photo.file_id, request_timeout=60)
+      await bot.download_file(file_info.file_path, destination=buf, timeout=60)
+      return buf.getvalue()
+    except TelegramNetworkError as e:
+      last_err = e
+      print(f"⚠️ Таймаут Telegram при скачивании фото (попытка {attempt}/{retries}): {e}")
+      if attempt < retries:
+        await asyncio.sleep(1.5 * attempt)
+  raise last_err
 
 
 # =====================================================================
@@ -299,10 +322,6 @@ def check_duplicate_receipt_sync(
     file_hash: str, amount: float, merchant: str,
     fiscal_id: str = "", receipt_date: str = "", receipt_time: str = "",
 ) -> dict:
-  """
-  Проверяет наличие точного дубликата чека в листе «Операции».
-  Не блокирует поездки/чеки с одинаковой суммой, если дата или время чека отличаются.
-  """
   try:
     ws = spreadsheet.worksheet("Операции")
     rows = ws.get_all_values()[1:]
@@ -326,15 +345,10 @@ def check_duplicate_receipt_sync(
 
       matched = False
 
-      # 1. Точное совпадение по цифровому MD5-хэшу самого файла
       if file_hash and row_hash and file_hash == row_hash:
         matched = True
-
-      # 2. Точное совпадение по фискальному признаку / номеру чека / номеру заказа
       elif fiscal_clean and len(fiscal_clean) >= 5 and fiscal_clean in comment:
         matched = True
-
-      # 3. Совпадение по сумме + поставщику + ДАТЕ И ВРЕМЕНИ на самом чеке
       elif abs(row_amt - amount) < 0.01 and r_date and r_time:
         if r_date in comment and r_time in comment:
           if merchant_clean and (merchant_clean in comment or (merchant_clean in ["яндекс go", "такси"] and "такси" in comment)):
@@ -1445,7 +1459,9 @@ async def msg_taxi_prompt(m: types.Message):
   night = now.hour >= 22 or now.hour < 7
   mode_txt = "🌙 Ночной тариф (22:00–07:00) — начисление сразу!" if night else "☀️ Дневной тариф — через согласование с Администратором."
   await m.answer(
-      f"🚕 <b>Учет поездок на такси</b>\n━━━━━━━━━━━━━━\nОтправьте скриншот поездки из Яндекс Go.\n<blockquote>{mode_txt}</blockquote>",
+      f"🚕 <b>Учет поездок на такси</b>\n━━━━━━━━━━━━━━\n"
+      f"Отправьте скриншот поездки из истории заказов (где видны <b>дата, время и сумма</b>).\n"
+      f"<blockquote>{mode_txt}</blockquote>",
       parse_mode="HTML",
   )
 
@@ -1467,15 +1483,17 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   await state.clear()
   photo = m.photo[-1]
 
-  wait = await m.answer("🔍 <b>Сканирую чек и сохраняю на Диск...</b>", parse_mode="HTML")
-  buf = io.BytesIO()
-  await bot.download(photo, destination=buf)
-  img_bytes = buf.getvalue()
+  wait = await m.answer("🔍 <b>Сканирую чек...</b>", parse_mode="HTML")
+  try:
+    img_bytes = await download_photo_bytes(photo)
+  except TelegramNetworkError:
+    return await wait.edit_text(
+        "⚠️ <b>Сервер Telegram не ответил вовремя при загрузке фото.</b>\n"
+        "Пожалуйста, отправьте чек ещё раз.",
+        parse_mode="HTML",
+    )
 
   file_hash = hashlib.md5(img_bytes).hexdigest()
-
-  fname = f"check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
-  drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
 
   image_part = genai_types.Part.from_bytes(
       data=img_bytes,
@@ -1484,13 +1502,16 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
 
   prompt = (
       "Распознай данные кассового чека или скриншота поездки такси на фото. "
-      "Найди итоговую сумму (ИТОГ / ВСЕГО / СУММА), продавца, краткое описание (позиции или маршрут), "
-      "а также дату и время на самом чеке/скриншоте и фискальный номер/номер заказа. "
+      "КРИТИЧЕСКИ ВАЖНО ПО ВРЕМЕНИ И ДАТЕ: "
+      "1. КАТЕГОРИЧЕСКИ ИГНОРИРУЙ часы и дату в верхней системной строке состояния телефона (status bar рядом с иконками сети, Wi-Fi и заряда батареи) — это время скриншота, а не поездки! "
+      "2. Для такси (Яндекс Go, inDrive и др.) бери дату и время ТОЛЬКО из самой карточки заказа или блока «Детали поездки» (например: «Поездка 20 ноября в 19:15», «Подача 19:10», «Завершение 19:28» или из электронного чека поездки). Если внутри карточки поездки время не указано (виден только маршрут и цена), верни для receipt_time пустую строку \"\". "
+      "3. Для кассовых и банковских чеков (Kaspi и др.) бери дату и время ТОЛЬКО из текста самого чека («Дата и время», «Время», рядом с ФП). "
+      "Найди итоговую сумму (ИТОГ / ВСЕГО / СУММА), продавца, краткое описание (для такси — адреса откуда и куда, для чеков — основные позиции), а также фискальный номер/номер заказа. "
       "Верни ТОЛЬКО валидный JSON без лишнего текста: "
       '{"amount": число_суммы_без_пробелов, "merchant": "название продавца или Яндекс Go", '
-      '"category": "Такси" или "Прочие расходы", "description": "кратко позиции или маршрут (2-6 слов)", '
-      '"receipt_date": "дата на чеке в формате ДД.ММ.ГГГГ или пустая строка", '
-      '"receipt_time": "время на чеке в формате ЧЧ:ММ или пустая строка", '
+      '"category": "Такси" или "Прочие расходы", "description": "кратко маршрут (Откуда - Куда) или позиции (2-6 слов)", '
+      '"receipt_date": "дата из карточки поездки/чека в формате ДД.ММ.ГГГГ или пустая строка", '
+      '"receipt_time": "время ТОЛЬКО из карточки поездки/чека в формате ЧЧ:ММ (БЕЗ времени телефона!) или пустая строка", '
       '"fiscal_id": "номер чека, ФП или номер заказа такси, если есть, иначе пустая строка"}'
   )
 
@@ -1508,11 +1529,27 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   cat = str(data.get("category", "Прочие расходы")).strip()
   desc = str(data.get("description", "")).strip()
   receipt_date = str(data.get("receipt_date", "")).strip()
-  receipt_time = str(data.get("receipt_time", "")).strip()
+  raw_time = str(data.get("receipt_time", "")).strip()
   fiscal_id = str(data.get("fiscal_id", "")).strip()
+
+  # Проверяем, что время действительно в формате ЧЧ:ММ
+  time_match = re.search(r"\b([01]?\d|2[0-3]):([0-5]\d)\b", raw_time)
+  receipt_time = f"{int(time_match.group(1)):02d}:{time_match.group(2)}" if time_match else ""
+
+  is_taxi = cat == "Такси" or any(w in merch.lower() for w in ("яндекс", "такси", "indrive", "uber"))
+
+  # Если это такси и внутри карточки поездки нет времени — просим правильный скриншот
+  if is_taxi and not receipt_time:
+    return await wait.edit_text(
+        "⚠️ <b>На скриншоте не указано время поездки!</b>\n━━━━━━━━━━━━━━\n"
+        "Время в верхней строке телефона не учитывается.\n\n"
+        "📸 <b>Пожалуйста, сделайте и отправьте скриншот с временем поездки:</b>\n"
+        "<blockquote>В Яндекс Go откройте <b>Меню ➔ История поездок ➔ выберите нужную поездку</b> и сделайте скриншот экрана, где видны дата, время и сумма.</blockquote>",
+        parse_mode="HTML",
+    )
+
   emp = await get_emp(m.from_user)
 
-  # ПРОВЕРКА НА ДУБЛИКАТ (с учётом даты и времени конкретного чека)
   dup_check = await asyncio.to_thread(
       check_duplicate_receipt_sync, file_hash, amt, merch, fiscal_id, receipt_date, receipt_time
   )
@@ -1532,8 +1569,11 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
     else:
       await m.answer("ℹ️ <i>Ранее этот чек был отклонен администратором. Отправляем на повторное рассмотрение.</i>", parse_mode="HTML")
 
+  fname = f"check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
+  drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
+
   pending_receipts[m.from_user.id] = {
-      "amount": amt, "merchant": merch, "category": cat,
+      "amount": amt, "merchant": merch, "category": "Такси" if is_taxi else cat,
       "desc": desc, "emp": emp, "link": drive_url,
       "fid": photo.file_unique_id, "file_id": photo.file_id,
       "file_hash": file_hash, "receipt_date": receipt_date,
@@ -1541,10 +1581,8 @@ async def handle_receipt_photo(m: types.Message, state: FSMContext):
   }
 
   now = now_astana()
-  is_taxi = cat == "Такси" or "яндекс" in merch.lower()
   badge = ""
   if is_taxi:
-    pending_receipts[m.from_user.id]["category"] = "Такси"
     badge = "\n🌙 <i>Ночное такси (автоодобрение)</i>" if (now.hour >= 22 or now.hour < 7) else "\n☀️ <i>Дневное такси (на согласование)</i>"
 
   dt_line = ""
@@ -1603,7 +1641,6 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
     now = now_astana()
     is_taxi = rec["category"] == "Такси"
 
-    # Формируем подробное описание с метаданными чека (дата/время/номер)
     meta_parts = []
     dt_str = f"{rec.get('receipt_date', '')} {rec.get('receipt_time', '')}".strip()
     if dt_str:
@@ -1655,7 +1692,6 @@ async def cb_universal_date_picked(c: types.CallbackQuery, state: FSMContext):
         tx_id, uid, rec.get("file_hash", ""),
     )
 
-    # Отправляем фото чека администратору для прозрачного контроля расходов
     admin_caption = (
         f"🧾 <b>Новый чек зачислен</b> (<code>{tx_id}</code>)\n━━━━━━━━━━━━━━\n"
         f"👤 Сотрудник: <b>{rec['emp']}</b>\n"
@@ -1719,7 +1755,6 @@ async def cb_taxi_decision(c: types.CallbackQuery):
   icon = "✅ Одобрено" if act == "tx_ok" else "❌ Отклонено"
   approver = c.from_user.full_name or "Администратор"
 
-  # Сохраняем фото и прежнюю подпись, добавляя итоговый статус
   base_text = c.message.caption or c.message.text or f"Операция {tx_id}"
   updated_text = f"{base_text}\n\n━━━━━━━━━━━━━━\n{icon} ({approver}) — статус: <b>{new_st}</b>"
 
@@ -1958,9 +1993,14 @@ async def process_fast_expense_photo(m: types.Message, state: FSMContext):
   wait = await m.answer("🔍 <b>Сканирую чек кассы и сохраняю в папку «Чеки»...</b>", parse_mode="HTML")
 
   photo = m.photo[-1]
-  buf = io.BytesIO()
-  await bot.download(photo, destination=buf)
-  img_bytes = buf.getvalue()
+  try:
+    img_bytes = await download_photo_bytes(photo)
+  except TelegramNetworkError:
+    return await wait.edit_text(
+        "⚠️ <b>Сервер Telegram не ответил вовремя при загрузке фото.</b>\n"
+        "Пожалуйста, повторите операцию расхода кассы.",
+        parse_mode="HTML",
+    )
 
   fname = f"admin_check_{m.from_user.id}_{now_astana().strftime('%d%m_%H%M%S')}.jpg"
   drive_url = await asyncio.to_thread(upload_to_drive_sync, img_bytes, fname)
@@ -2318,7 +2358,7 @@ async def main():
 
   await asyncio.to_thread(sync_roles_and_formulas)
   asyncio.create_task(shift_timer_loop())
-  await dp.start_polling(bot)
+  await dp.start_polling(bot, polling_timeout=20)
 
 
 if __name__ == "__main__":
