@@ -61,8 +61,12 @@ SHIFT_TIMEOUT_M = 30
 MEAL_AMOUNT = 2500.0
 
 # Принудительный IPv4 и закрытие зависших сокетов для стабильной работы на Render
-tg_session = AiohttpSession(family=socket.AF_INET, force_close=True)
-tg_session.timeout = 90.0
+tg_session = AiohttpSession(timeout=90.0)
+if hasattr(tg_session, "_connector_init") and isinstance(
+    tg_session._connector_init, dict
+):
+  tg_session._connector_init["family"] = socket.AF_INET
+  tg_session._connector_init["force_close"] = True
 
 bot = Bot(token=BOT_TOKEN, session=tg_session)
 dp = Dispatcher(storage=MemoryStorage())
